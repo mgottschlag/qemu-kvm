@@ -230,6 +230,7 @@ want_tools="yes"
 libiscsi=""
 coroutine=""
 seccomp=""
+pscnv=""
 
 # parse CC options first
 for opt do
@@ -885,6 +886,10 @@ for opt do
   --enable-seccomp) seccomp="yes"
   ;;
   --disable-seccomp) seccomp="no"
+  ;;
+  --disable-pscnv) pscnv="no"
+  ;;
+  --enable-pscnv) pscnv="yes"
   ;;
   *) echo "ERROR: unknown option $opt"; show_help="yes"
   ;;
@@ -3489,6 +3494,10 @@ fi
 
 if test "$seccomp" = "yes"; then
   echo "CONFIG_SECCOMP=y" >> $config_host_mak
+fi
+
+if test "$pscnv" = "yes" ; then
+  echo "CONFIG_PSCNV=y" >> $config_host_mak
 fi
 
 # XXX: suppress that
