@@ -3498,6 +3498,7 @@ fi
 
 if test "$pscnv" = "yes" ; then
   echo "CONFIG_PSCNV=y" >> $config_host_mak
+  LDFLAGS="-ldrm_pscnv $LDFLAGS"
 fi
 
 # XXX: suppress that
