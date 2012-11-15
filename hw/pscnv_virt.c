@@ -10,7 +10,7 @@
 #define PAGE_SIZE (1 << PAGE_SHIFT)
 #define PAGE_MASK (PAGE_SIZE - 1)
 
-#define PSCNV_DEBUG_IO
+//#define PSCNV_DEBUG_IO
 
 #define PSCNV_VIRT_MMIO_SIZE 0x1000
 #define PSCNV_CALL_SLOT_SIZE 0x100
@@ -239,7 +239,7 @@ static void pscnv_execute_mem_alloc(PscnvState *d,
     int ret;
     struct pscnv_memory_allocation result;
 
-    fprintf(stderr, "vm wants to allocate %"PRIx64" bytes\n", cmd->size);
+    //fprintf(stderr, "vm wants to allocate %"PRIx64" bytes\n", cmd->size);
     /* allocate a gem object */
     ret = pscnv_gem_new(d->drm_fd, cmd->cookie, cmd->flags, cmd->tile_flags,
                         cmd->size, NULL, &result.handle, &result.map_handle);
@@ -251,8 +251,8 @@ static void pscnv_execute_mem_alloc(PscnvState *d,
     result.mapped_page = (uint32_t)-1;
     result.cid = (uint32_t)-1;
     cmd->handle = add_allocation_entry(d, &result);
-    fprintf(stderr, "pscnv_virt: allocated %"PRIx64" bytes, handle %d\n",
-            cmd->size, cmd->handle);
+    //fprintf(stderr, "pscnv_virt: allocated %"PRIx64" bytes, handle %d\n",
+    //        cmd->size, cmd->handle);
 
     cmd->command = PSCNV_RESULT_NO_ERROR;
 }
@@ -291,7 +291,7 @@ static void pscnv_execute_map(PscnvState *d,
     unsigned int page_count, i, prev_page, first_page = 0;
     void *remapped;
 
-    fprintf(stderr, "vm wants to map %d\n", cmd->handle);
+    //fprintf(stderr, "vm wants to map %d\n", cmd->handle);
 
     /* TODO: check whether the object is already mapped */
 
@@ -329,7 +329,7 @@ static void pscnv_execute_map(PscnvState *d,
         } else {
             first_page = page;
         }
-        fprintf(stderr, "pscnv_virt: mapping bo page to BAR page %d\n", page);
+        //fprintf(stderr, "pscnv_virt: mapping bo page to BAR page %d\n", page);
         d->vram_pages[page].mapped = calloc(sizeof(struct pscnv_map_page), 1);
         d->vram_pages[page].mapped->handle = cmd->handle;
         remapped = mremap((char*)mapped + i * PAGE_SIZE, PAGE_SIZE, PAGE_SIZE,
@@ -523,11 +523,11 @@ static void pscnv_execute_hypercall(PscnvState *d, uint32_t call_addr)
     volatile uint32_t *call_data = (uint32_t*)(d->call_area_memory + call_addr);
     uint32_t command = call_data[0];
 
-    fprintf(stderr, "pscnv_virt: command 0x%x.\n", command);
+    //fprintf(stderr, "pscnv_virt: command 0x%x.\n", command);
     switch (command) {
     case PSCNV_CMD_GET_PARAM:
         /* TODO: remove this */
-        fprintf(stderr, "pscnv_virt: PSCNV_CMD_GET_PARAM.\n");
+        //fprintf(stderr, "pscnv_virt: PSCNV_CMD_GET_PARAM.\n");
         call_data[1] = 0x12345678;
         call_data[0] = PSCNV_RESULT_NO_ERROR;
         break;
