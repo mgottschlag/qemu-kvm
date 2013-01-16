@@ -17,7 +17,6 @@
 #define PSCNV_CALL_SLOT_COUNT 32
 #define PSCNV_CALL_AREA_SIZE (PSCNV_CALL_SLOT_COUNT * PSCNV_CALL_SLOT_SIZE)
 #define PSCNV_VIRT_VRAM_SIZE 0x10000000
-#define VRAM_PAGE_COUNT (PSCNV_VIRT_VRAM_SIZE >> PAGE_SHIFT)
 
 #define PSCNV_VIRT_CHAN_COUNT 128
 
@@ -54,18 +53,16 @@
 #define PSCNV_RESULT_UNKNOWN_CMD 0x80000001
 #define PSCNV_RESULT_ERROR 0x80000002
 
-#define DUMP_HYPERCALLS
+/*#define DUMP_HYPERCALLS
 #define PSCNV_DEBUG_CHAN_ACCESS
-#define PSCNV_DEBUG_VRAM_ACCESS
+#define PSCNV_DEBUG_VRAM_ACCESS*/
 
-struct pscnv_page {
-    unsigned int next;
-    struct pscnv_map_page *mapped;
-};
-
-struct pscnv_map_page {
-    uint32_t handle;
-    /*MemoryRegion vram_area;*/
+struct pscnv_memory_area {
+	uint32_t start;
+	uint32_t size;
+	struct pscnv_memory_area *next;
+	struct pscnv_memory_area *prev;
+	uint32_t handle;
 };
 
 struct pscnv_memory_allocation {
@@ -73,8 +70,8 @@ struct pscnv_memory_allocation {
     uint64_t map_handle;
     uint32_t handle;
     uint32_t next;
-    uint32_t mapped_page;
     uint32_t cid;
+	struct pscnv_memory_area *mapping;
 };
 
 typedef struct {
@@ -96,11 +93,7 @@ typedef struct {
     uint32_t alloc_count;
     uint32_t alloc_freelist;
 
-    struct pscnv_page *vram_pages;
-    unsigned int free_vram_page;
-
-    /* index into alloc_data for chan chan entries */
-    /*MemoryRegion chan[PSCNV_VIRT_CHAN_COUNT];*/
+	struct pscnv_memory_area *memory_areas;
 
     int is_nv50;
 } PscnvState;
@@ -122,8 +115,7 @@ struct pscnv_free_mem_cmd {
 struct pscnv_map_cmd {
     uint32_t command;
     uint32_t handle;
-    uint64_t result_table;
-    uint32_t page_count;
+    uint32_t start;
 };
 
 struct pscnv_vspace_cmd {
@@ -200,24 +192,48 @@ struct pscnv_obj_eng_new_cmd {
     int32_t ret;
 };
 
-
-static unsigned int allocate_page(PscnvState *d) {
-    unsigned int page = d->free_vram_page;
-
-    if (page == (unsigned int)-1) {
-        return page;
-    }
-    d->free_vram_page = d->vram_pages[page].next;
-    d->vram_pages[page].next = (unsigned int)-1;
-    return page;
+static struct pscnv_memory_area *allocate_memory(PscnvState *d,
+                                                 uint32_t size) {
+	struct pscnv_memory_area *area = d->memory_areas;
+	/* first-fit search for a memory area */
+	while (area != NULL
+			&& (area->size < size || area->handle != (uint32_t)-1)) {
+		area = area->next;
+	}
+	if (area == NULL) {
+		return NULL;
+	}
+	if (area->size != size) {
+		/* split the area */
+		struct pscnv_memory_area *splitted = malloc(sizeof(*splitted));
+		splitted->prev = area;
+		splitted->next = area->next;
+		splitted->start = area->start + size;
+		splitted->size = area->size - size;
+		splitted->handle = -1;
+		area->next = splitted;
+		area->size = size;
+	}
+	return area;
 }
 
-/*static void free_page(PscnvState *d, unsigned int page) {
-    assert(d->vram_pages[page].mapped == NULL);
-
-    d->vram_pages[page].next = d->free_vram_page;
-    d->free_vram_page = page;
-}*/
+static void free_memory(PscnvState *d, struct pscnv_memory_area *area) {
+	area->handle = -1;
+	if (area->prev != NULL && area->prev->handle == (uint32_t)-1) {
+		area = area->prev;
+	}
+	/* merge the area with adjacent free areas */
+	struct pscnv_memory_area *next = area->next;
+	while (next != NULL && next->handle == (uint32_t)-1) {
+		area->next = next->next;
+		if (next->next != NULL) {
+			next->next->prev = area;
+		}
+		area->size += next->size;
+		free(next);
+		next = area->next;
+	}
+}
 
 static uint32_t add_allocation_entry(PscnvState *d,
                                      struct pscnv_memory_allocation *entry) {
@@ -261,7 +277,7 @@ static void pscnv_execute_mem_alloc(PscnvState *d,
         return;
     }
     result.size = (cmd->size + 0xfff) & ~0xfff;
-    result.mapped_page = (uint32_t)-1;
+    result.mapping = NULL;
     result.cid = (uint32_t)-1;
     cmd->handle = add_allocation_entry(d, &result);
 #ifdef DUMP_HYPERCALLS
@@ -272,45 +288,16 @@ static void pscnv_execute_mem_alloc(PscnvState *d,
     cmd->command = PSCNV_RESULT_NO_ERROR;
 }
 
-static int return_page_list(PscnvState *d, unsigned int first_page,
-                            unsigned int page_count, uint64_t destination) {
-    MemoryRegionSection section;
-    void *memory;
-    uint32_t *list;
-    unsigned int i, page;
-
-    section = memory_region_find(get_system_memory(),
-                                 destination, page_count * 4);
-    if (section.size == 0) {
-        return -1;
-    }
-    if (memory_region_is_ram(section.mr) == 0) {
-        return -1;
-    }
-
-    memory = memory_region_get_ram_ptr(section.mr);
-    list = (uint32_t*)((char*)memory + section.offset_within_region);
-    page = first_page;
-    for (i = 0; i < page_count; i++) {
-        assert(page != (unsigned int)-1);
-        *list++ = page;
-        page = d->vram_pages[page].next;
-    }
-    return 0;
-}
-
 static void pscnv_execute_map(PscnvState *d,
                               volatile struct pscnv_map_cmd *cmd) {
     void *mapped;
     struct pscnv_memory_allocation *obj;
-    unsigned int page_count, i, prev_page, first_page = 0;
-    void *remapped;
+    /*unsigned int page_count, i, prev_page, first_page = 0;*/
+    /*void *remapped;*/
 
 #ifdef DUMP_HYPERCALLS
     fprintf(stderr, "pscnv_virt: vm wants to map %d\n", cmd->handle);
 #endif
-
-    /* TODO: check whether the object is already mapped */
 
     if (cmd->handle >= d->alloc_count
             || d->alloc_data[cmd->handle].size == (uint64_t)-1) {
@@ -320,9 +307,24 @@ static void pscnv_execute_map(PscnvState *d,
         return;
     }
     obj = &d->alloc_data[cmd->handle];
+    /* check whether the object is already mapped */
+	if (obj->mapping != NULL) {
+		cmd->start = obj->mapping->start;
+		cmd->command = PSCNV_RESULT_NO_ERROR;
+	}
+	/* find some free space in the vram bar */
+	obj->mapping = allocate_memory(d, obj->size);
+	if (obj->mapping == NULL) {
+        fprintf(stderr, "pscnv_virt: no space left to map %"PRIx64" bytes\n",
+                obj->size);
+        cmd->command = PSCNV_RESULT_ERROR;
+        return;
+	}
+	obj->mapping->handle = cmd->handle;
     /* map the gem object */
     /* TODO: access rights? */
-    mapped = mmap(0, obj->size, PROT_READ | PROT_WRITE, MAP_SHARED, d->drm_fd,
+    mapped = mmap(d->vram_bar_memory + obj->mapping->start, obj->size,
+			PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, d->drm_fd,
             obj->map_handle);
     if (((uintptr_t)mapped & PAGE_MASK) != 0) {
         fprintf(stderr, "pscnv_virt: mapped data not page-aligned: %p\n",
@@ -330,51 +332,19 @@ static void pscnv_execute_map(PscnvState *d,
         cmd->command = PSCNV_RESULT_ERROR;
         return;
     }
-    /* allocate some pages from the bar */
-    page_count = (obj->size + PAGE_MASK) >> PAGE_SHIFT;
-    /* map the data into the bar */
-    for (i = 0; i < page_count; i++) {
-        unsigned int page = allocate_page(d);
-        if (page == (unsigned int)-1) {
-            fprintf(stderr, "pscnv_virt: no virtual vram left\n");
-            /* TODO */
-            cmd->command = PSCNV_RESULT_ERROR;
-            return;
-        }
-        if (i != 0) {
-            d->vram_pages[prev_page].next = page;
-        } else {
-            first_page = page;
-        }
 #ifdef DUMP_HYPERCALLS
-        fprintf(stderr, "pscnv_virt: mapping bo page to BAR page %d\n", page);
+        fprintf(stderr, "pscnv_virt: mapped %d to %x\n",
+		        cmd->handle, obj->mapping->start);
 #endif
-        d->vram_pages[page].mapped = calloc(sizeof(struct pscnv_map_page), 1);
-        d->vram_pages[page].mapped->handle = cmd->handle;
-        remapped = mremap((char*)mapped + i * PAGE_SIZE, PAGE_SIZE, PAGE_SIZE,
-                     MREMAP_MAYMOVE | MREMAP_FIXED,
-                     d->vram_bar_memory + page * PAGE_SIZE);
-        if (remapped == MAP_FAILED) {
-            fprintf(stderr, "mremap failed!");
-            /* TODO */
-            cmd->command = PSCNV_RESULT_ERROR;
-            return;
-        }
-        prev_page = page;
-    }
-	obj->mapped_page = first_page;
-    /* return the addresses to the guest */
-    if (return_page_list(d, first_page, page_count, cmd->result_table)) {
-        fprintf(stderr, "pscnv_virt: invalid map result destination\n");
-        cmd->command = PSCNV_RESULT_ERROR;
-    }
+	cmd->start = obj->mapping->start;
     cmd->command = PSCNV_RESULT_NO_ERROR;
 }
 
 static void pscnv_execute_mem_free(PscnvState *d,
                                    volatile struct pscnv_free_mem_cmd *cmd) {
-	struct pscnv_memory_allocation *allocation;
-#ifdef DUMP_HYPERCALLS
+	struct pscnv_memory_allocation *obj;
+	void *result;
+#ifdef DUMP_HYPERCALL
     fprintf(stderr, "pscnv_mem_free: %d\n", cmd->handle);
 #endif
 	if (cmd->handle >= d->alloc_count
@@ -384,29 +354,21 @@ static void pscnv_execute_mem_free(PscnvState *d,
         cmd->command = PSCNV_RESULT_ERROR;
         return;
     }
-	allocation = &d->alloc_data[cmd->handle];
+	obj = &d->alloc_data[cmd->handle];
 	/* free the underlying gpu buffer */
-	pscnv_gem_close(d->drm_fd, allocation->handle);
-	/* clear all mappings */
-	while (allocation->mapped_page != (uint32_t)-1) {
-		uint32_t page_index = allocation->mapped_page;
-		void *result;
-		/* return the page into the freelist */
-		struct pscnv_page *page = &d->vram_pages[page_index];
-		allocation->mapped_page = page->next;
-		page->next = d->free_vram_page;
-		d->free_vram_page = page_index;
-		free(page->mapped);
-		page->mapped = NULL;
-		/* unmap the page */
-		result = mmap(d->vram_bar_memory + page_index * PAGE_SIZE, PAGE_SIZE,
+	pscnv_gem_close(d->drm_fd, obj->handle);
+	/* clear the mapping */
+	if (obj->mapping != NULL) {
+		result = mmap(d->vram_bar_memory + obj->mapping->start, obj->size,
 				PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
 		if (result == MAP_FAILED) {
-			fprintf(stderr, "pscnv_virt: could not unmap page %d\n", page_index);
+			fprintf(stderr, "pscnv_virt: could not unmap %d\n", cmd->handle);
 		}
+		/* mark the memory area as free */
+		free_memory(d, obj->mapping);
 	}
 	/* free the allocation list entry */
-	allocation->next = d->alloc_freelist;
+	obj->next = d->alloc_freelist;
 	d->alloc_freelist = cmd->handle;
 
     cmd->command = PSCNV_RESULT_NO_ERROR;
@@ -966,8 +928,6 @@ static int pci_pscnv_init(PCIDevice *pci_dev)
     uint8_t *pci_conf;
     unsigned int i;
 
-    /*memset(d->chan, 0xff, sizeof(d->chan));*/
-
     /* initialize the gpu */
     d->drm_fd = drmOpen("pscnv", 0);
     if (d->drm_fd < 0) {
@@ -982,15 +942,6 @@ static int pci_pscnv_init(PCIDevice *pci_dev)
             read_gpu_info(d, PSCNV_GETPARAM_BUS_TYPE);
     d->gpu_info[PSCNV_INFO_CHIPSET_ID] =
             read_gpu_info(d, PSCNV_GETPARAM_CHIPSET_ID);
-    d->alloc_data = calloc(sizeof(struct pscnv_memory_allocation), 16);
-    d->alloc_count = 16;
-    d->alloc_freelist = 0;
-    for (i = 0; i < 16; i++) {
-        d->alloc_data[i].size = -1;
-        d->alloc_data[i].next = i + 1;
-    }
-    d->alloc_data[15].next = -1;
-    /* TODO: build freelist and validity information */
     /* TODO: this does not work? o.O */
     /*d->gpu_info[PSCNV_INFO_GRAPH_UNITS] =
             read_gpu_info(d, PSCNV_GETPARAM_GRAPH_UNITS);*/
@@ -1001,6 +952,16 @@ static int pci_pscnv_init(PCIDevice *pci_dev)
             read_gpu_info(d, /*PSCNV_GETPARAM_TP_COUNT_IDX*/ 16);
     d->gpu_info[PSCNV_INFO_MP_COUNT] =
             read_gpu_info(d, /*PSCNV_GETPARAM_MP_COUNT*/ 100);
+
+	/* allocation struct freelist */
+    d->alloc_data = calloc(sizeof(struct pscnv_memory_allocation), 16);
+    d->alloc_count = 16;
+    d->alloc_freelist = 0;
+    for (i = 0; i < 16; i++) {
+        d->alloc_data[i].size = -1;
+        d->alloc_data[i].next = i + 1;
+    }
+    d->alloc_data[15].next = -1;
 
     /* NV50 has longer channels */
     d->is_nv50 = 0;
@@ -1071,13 +1032,13 @@ static int pci_pscnv_init(PCIDevice *pci_dev)
 #endif
     pci_register_bar(pci_dev, 3, 0, &d->chan_bar);
 
-    /* build a single linked list of the available vram pages */
-    d->vram_pages = malloc(VRAM_PAGE_COUNT * sizeof(struct pscnv_page));
-    for (i = 0; i < VRAM_PAGE_COUNT; i++) {
-        d->vram_pages[i].next = i + 1;
-    }
-    d->vram_pages[VRAM_PAGE_COUNT - 1].next = (unsigned int)-1;
-    d->free_vram_page = 0;
+	/* mark the whole bar as free */
+	struct pscnv_memory_area *memory_area = malloc(sizeof(*memory_area));
+	memory_area->start = 0;
+	memory_area->size = PSCNV_VIRT_VRAM_SIZE;
+	memory_area->next = memory_area->prev = NULL;
+	memory_area->handle = (uint32_t)-1;
+	d->memory_areas = memory_area;
 
     /*d->irq = pci_dev->irq[0];*/
 
