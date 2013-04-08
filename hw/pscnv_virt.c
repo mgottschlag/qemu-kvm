@@ -1,6 +1,7 @@
 
 #include "pci.h"
 #include "exec-memory.h"
+#include "vmstate.h"
 
 #include <libpscnv.h>
 #include <xf86drm.h>
@@ -53,16 +54,16 @@
 #define PSCNV_RESULT_UNKNOWN_CMD 0x80000001
 #define PSCNV_RESULT_ERROR 0x80000002
 
-/*#define DUMP_HYPERCALLS
-#define PSCNV_DEBUG_CHAN_ACCESS
+#define DUMP_HYPERCALLS
+/*#define PSCNV_DEBUG_CHAN_ACCESS
 #define PSCNV_DEBUG_VRAM_ACCESS*/
 
 struct pscnv_memory_area {
-	uint32_t start;
-	uint32_t size;
-	struct pscnv_memory_area *next;
-	struct pscnv_memory_area *prev;
-	uint32_t handle;
+    uint32_t start;
+    uint32_t size;
+    struct pscnv_memory_area *next;
+    struct pscnv_memory_area *prev;
+    uint32_t handle;
 };
 
 struct pscnv_memory_allocation {
@@ -71,32 +72,9 @@ struct pscnv_memory_allocation {
     uint32_t handle;
     uint32_t next;
     uint32_t cid;
-	struct pscnv_memory_area *mapping;
+    struct pscnv_memory_area *mapping;
+    void *migration_mapping;
 };
-
-typedef struct {
-    PCIDevice pci_dev;
-    MemoryRegion mmio_bar;
-    MemoryRegion call_area_bar;
-    MemoryRegion vram_bar;
-    unsigned int chan_bar_size;
-    MemoryRegion chan_bar;
-    char *call_area_memory;
-    char *vram_bar_memory;
-    char *chan_bar_memory;
-    /*qemu_irq irq;*/
-
-    int drm_fd;
-    uint32_t gpu_info[PSCNV_INFO_COUNT];
-
-    struct pscnv_memory_allocation *alloc_data;
-    uint32_t alloc_count;
-    uint32_t alloc_freelist;
-
-	struct pscnv_memory_area *memory_areas;
-
-    int is_nv50;
-} PscnvState;
 
 struct pscnv_alloc_mem_cmd {
     uint32_t command;
@@ -192,47 +170,95 @@ struct pscnv_obj_eng_new_cmd {
     int32_t ret;
 };
 
+typedef struct {
+    PCIDevice pci_dev;
+    MemoryRegion mmio_bar;
+    MemoryRegion call_area_bar;
+    MemoryRegion vram_bar;
+    unsigned int chan_bar_size;
+    MemoryRegion chan_bar;
+    char *call_area_memory;
+    char *vram_bar_memory;
+    char *chan_bar_memory;
+    uint32_t chan_handle[PSCNV_VIRT_CHAN_COUNT];
+    uint32_t chan_vspace[PSCNV_VIRT_CHAN_COUNT];
+    struct pscnv_fifo_init_ib_cmd fifo_init[PSCNV_VIRT_CHAN_COUNT];
+    void *channel_content;
+
+    int drm_fd;
+    uint32_t gpu_info[PSCNV_INFO_COUNT];
+
+    struct pscnv_memory_allocation *alloc_data;
+    uint32_t alloc_count;
+    uint32_t alloc_freelist;
+
+    struct pscnv_memory_area *memory_areas;
+
+    int is_nv50;
+} PscnvState;
+
+
+/**
+ * Checks whether an entry in the chan memory region is associated with a
+ * pscnv channel.
+ */
+static int chan_is_allocated(PscnvState *d, uint32_t chan) {
+    return d->chan_handle[chan] != (uint32_t)-1;
+}
+/**
+ * Finds a free entry in the chan memory region.
+ */
+static char allocate_chan(PscnvState *d) {
+    unsigned int i;
+    for (i = 0; i < PSCNV_VIRT_CHAN_COUNT; i++) {
+        if (d->chan_handle[i] == (uint32_t)-1) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 static struct pscnv_memory_area *allocate_memory(PscnvState *d,
                                                  uint32_t size) {
-	struct pscnv_memory_area *area = d->memory_areas;
-	/* first-fit search for a memory area */
-	while (area != NULL
-			&& (area->size < size || area->handle != (uint32_t)-1)) {
-		area = area->next;
-	}
-	if (area == NULL) {
-		return NULL;
-	}
-	if (area->size != size) {
-		/* split the area */
-		struct pscnv_memory_area *splitted = malloc(sizeof(*splitted));
-		splitted->prev = area;
-		splitted->next = area->next;
-		splitted->start = area->start + size;
-		splitted->size = area->size - size;
-		splitted->handle = -1;
-		area->next = splitted;
-		area->size = size;
-	}
-	return area;
+    struct pscnv_memory_area *area = d->memory_areas;
+    /* first-fit search for a memory area */
+    while (area != NULL
+            && (area->size < size || area->handle != (uint32_t)-1)) {
+        area = area->next;
+    }
+    if (area == NULL) {
+        return NULL;
+    }
+    if (area->size != size) {
+        /* split the area */
+        struct pscnv_memory_area *splitted = malloc(sizeof(*splitted));
+        splitted->prev = area;
+        splitted->next = area->next;
+        splitted->start = area->start + size;
+        splitted->size = area->size - size;
+        splitted->handle = -1;
+        area->next = splitted;
+        area->size = size;
+    }
+    return area;
 }
 
 static void free_memory(PscnvState *d, struct pscnv_memory_area *area) {
-	area->handle = -1;
-	if (area->prev != NULL && area->prev->handle == (uint32_t)-1) {
-		area = area->prev;
-	}
-	/* merge the area with adjacent free areas */
-	struct pscnv_memory_area *next = area->next;
-	while (next != NULL && next->handle == (uint32_t)-1) {
-		area->next = next->next;
-		if (next->next != NULL) {
-			next->next->prev = area;
-		}
-		area->size += next->size;
-		free(next);
-		next = area->next;
-	}
+    area->handle = -1;
+    if (area->prev != NULL && area->prev->handle == (uint32_t)-1) {
+        area = area->prev;
+    }
+    /* merge the area with adjacent free areas */
+    struct pscnv_memory_area *next = area->next;
+    while (next != NULL && next->handle == (uint32_t)-1) {
+        area->next = next->next;
+        if (next->next != NULL) {
+            next->next->prev = area;
+        }
+        area->size += next->size;
+        free(next);
+        next = area->next;
+    }
 }
 
 static uint32_t add_allocation_entry(PscnvState *d,
@@ -308,23 +334,23 @@ static void pscnv_execute_map(PscnvState *d,
     }
     obj = &d->alloc_data[cmd->handle];
     /* check whether the object is already mapped */
-	if (obj->mapping != NULL) {
-		cmd->start = obj->mapping->start;
-		cmd->command = PSCNV_RESULT_NO_ERROR;
-	}
-	/* find some free space in the vram bar */
-	obj->mapping = allocate_memory(d, obj->size);
-	if (obj->mapping == NULL) {
+    if (obj->mapping != NULL) {
+        cmd->start = obj->mapping->start;
+        cmd->command = PSCNV_RESULT_NO_ERROR;
+    }
+    /* find some free space in the vram bar */
+    obj->mapping = allocate_memory(d, obj->size);
+    if (obj->mapping == NULL) {
         fprintf(stderr, "pscnv_virt: no space left to map %"PRIx64" bytes\n",
                 obj->size);
         cmd->command = PSCNV_RESULT_ERROR;
         return;
-	}
-	obj->mapping->handle = cmd->handle;
+    }
+    obj->mapping->handle = cmd->handle;
     /* map the gem object */
     /* TODO: access rights? */
     mapped = mmap(d->vram_bar_memory + obj->mapping->start, obj->size,
-			PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, d->drm_fd,
+            PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, d->drm_fd,
             obj->map_handle);
     if (((uintptr_t)mapped & PAGE_MASK) != 0) {
         fprintf(stderr, "pscnv_virt: mapped data not page-aligned: %p\n",
@@ -334,42 +360,42 @@ static void pscnv_execute_map(PscnvState *d,
     }
 #ifdef DUMP_HYPERCALLS
         fprintf(stderr, "pscnv_virt: mapped %d to %x\n",
-		        cmd->handle, obj->mapping->start);
+                cmd->handle, obj->mapping->start);
 #endif
-	cmd->start = obj->mapping->start;
+    cmd->start = obj->mapping->start;
     cmd->command = PSCNV_RESULT_NO_ERROR;
 }
 
 static void pscnv_execute_mem_free(PscnvState *d,
                                    volatile struct pscnv_free_mem_cmd *cmd) {
-	struct pscnv_memory_allocation *obj;
-	void *result;
+    struct pscnv_memory_allocation *obj;
+    void *result;
 #ifdef DUMP_HYPERCALL
     fprintf(stderr, "pscnv_mem_free: %d\n", cmd->handle);
 #endif
-	if (cmd->handle >= d->alloc_count
+    if (cmd->handle >= d->alloc_count
             || d->alloc_data[cmd->handle].size == (uint64_t)-1) {
         fprintf(stderr, "pscnv_virt: invalid handle %d (size: %"PRIx64", objects: %d)\n",
                 cmd->handle, d->alloc_data[cmd->handle].size, d->alloc_count);
         cmd->command = PSCNV_RESULT_ERROR;
         return;
     }
-	obj = &d->alloc_data[cmd->handle];
-	/* free the underlying gpu buffer */
-	pscnv_gem_close(d->drm_fd, obj->handle);
-	/* clear the mapping */
-	if (obj->mapping != NULL) {
-		result = mmap(d->vram_bar_memory + obj->mapping->start, obj->size,
-				PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-		if (result == MAP_FAILED) {
-			fprintf(stderr, "pscnv_virt: could not unmap %d\n", cmd->handle);
-		}
-		/* mark the memory area as free */
-		free_memory(d, obj->mapping);
-	}
-	/* free the allocation list entry */
-	obj->next = d->alloc_freelist;
-	d->alloc_freelist = cmd->handle;
+    obj = &d->alloc_data[cmd->handle];
+    /* free the underlying gpu buffer */
+    pscnv_gem_close(d->drm_fd, obj->handle);
+    /* clear the mapping */
+    if (obj->mapping != NULL) {
+        result = mmap(d->vram_bar_memory + obj->mapping->start, obj->size,
+                PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        if (result == MAP_FAILED) {
+            fprintf(stderr, "pscnv_virt: could not unmap %d\n", cmd->handle);
+        }
+        /* mark the memory area as free */
+        free_memory(d, obj->mapping);
+    }
+    /* free the allocation list entry */
+    obj->next = d->alloc_freelist;
+    d->alloc_freelist = cmd->handle;
 
     cmd->command = PSCNV_RESULT_NO_ERROR;
 }
@@ -465,6 +491,7 @@ static void pscnv_execute_chan_new(PscnvState *d,
                                    volatile struct pscnv_chan_new_cmd *cmd)
 {
     uint32_t cid;
+    uint32_t chan_index;
     uint64_t map_handle;
     int ret;
     unsigned int chsize;
@@ -485,19 +512,24 @@ static void pscnv_execute_chan_new(PscnvState *d,
         return;
     }
     /* map the channel into the channel BAR */
+    chan_index = allocate_chan(d);
+    assert(chan_index < PSCNV_VIRT_CHAN_COUNT);
     chsize = d->is_nv50 ? 0x2000 : 0x1000;
-    chmem = mmap(d->chan_bar_memory + cid * chsize, chsize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, d->drm_fd,
+    chmem = mmap(d->chan_bar_memory + chan_index * chsize, chsize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, d->drm_fd,
                  map_handle);
     if (chmem == MAP_FAILED) {
         fprintf(stderr, "pscnv_virt: Could not map channel %d\n", cid);
         cmd->command = PSCNV_RESULT_ERROR;
         return;
     }
+    d->chan_handle[chan_index] = cid;
+    d->chan_vspace[chan_index] = cmd->vid;
+    d->fifo_init[chan_index].command = -1;
 
 #ifdef DUMP_HYPERCALLS
-    fprintf(stderr, "pscnv_chan_new: result %d\n", cid);
+    fprintf(stderr, "pscnv_chan_new: result %d (%d)\n", cid, chan_index);
 #endif
-    cmd->cid = cid;
+    cmd->cid = chan_index;
     cmd->command = PSCNV_RESULT_NO_ERROR;
 
 }
@@ -507,12 +539,20 @@ static void pscnv_execute_chan_free(PscnvState *d,
     int ret;
     void *chmem;
     unsigned int chsize;
+    uint32_t cid;
 
+    if (cmd->cid >= PSCNV_VIRT_CHAN_COUNT
+            || d->chan_handle[cmd->cid] == (uint32_t)-1) {
+        fprintf(stderr, "pscnv_virt: pscnv_chan_free invalid cid %d\n", cmd->cid);
+        cmd->command = PSCNV_RESULT_ERROR;
+        return;
+    }
+    cid = d->chan_handle[cmd->cid];
 #ifdef DUMP_HYPERCALLS
-    fprintf(stderr, "pscnv_chan_free: %d\n", cmd->cid);
+    fprintf(stderr, "pscnv_chan_free: %d (%d)\n", cid, cmd->cid);
 #endif
     /* delete that channel */
-    ret = pscnv_chan_free(d->drm_fd, cmd->cid);
+    ret = pscnv_chan_free(d->drm_fd, cid);
     if (ret) {
         fprintf(stderr, "pscnv_virt: pscnv_chan_free failed (%d)\n", ret);
         cmd->command = PSCNV_RESULT_ERROR;
@@ -529,6 +569,7 @@ static void pscnv_execute_chan_free(PscnvState *d,
         return;
     }
 
+    d->chan_handle[cmd->cid] = (uint32_t)-1;
 
     cmd->command = PSCNV_RESULT_NO_ERROR;
 
@@ -537,11 +578,20 @@ static void pscnv_execute_chan_free(PscnvState *d,
 static void pscnv_execute_obj_vdma_new(PscnvState *d,
                                     volatile struct pscnv_obj_vdma_new_cmd *cmd)
 {
+    uint32_t cid;
+
+    if (cmd->cid >= PSCNV_VIRT_CHAN_COUNT
+            || d->chan_handle[cmd->cid] == (uint32_t)-1) {
+        fprintf(stderr, "pscnv_virt: pscnv_execute_obj_vdma_new invalid cid %d\n", cmd->cid);
+        cmd->command = PSCNV_RESULT_ERROR;
+        return;
+    }
+    cid = d->chan_handle[cmd->cid];
 #ifdef DUMP_HYPERCALLS
-    fprintf(stderr, "pscnv_obj_vdma_new: %d 0x%x 0x%x 0x%x 0x%"PRIx64" 0x%"PRIx64"\n",
-            cmd->cid, cmd->handle, cmd->oclass, cmd->flags, cmd->start, cmd->size);
+    fprintf(stderr, "pscnv_obj_vdma_new: %d (%d) 0x%x 0x%x 0x%x 0x%"PRIx64" 0x%"PRIx64"\n",
+            cid, cmd->cid, cmd->handle, cmd->oclass, cmd->flags, cmd->start, cmd->size);
 #endif
-    cmd->ret = pscnv_obj_vdma_new(d->drm_fd, cmd->cid, cmd->handle, cmd->oclass,
+    cmd->ret = pscnv_obj_vdma_new(d->drm_fd, cid, cmd->handle, cmd->oclass,
                                   cmd->flags, cmd->start, cmd->size);
     cmd->command = PSCNV_RESULT_NO_ERROR;
 }
@@ -549,11 +599,20 @@ static void pscnv_execute_obj_vdma_new(PscnvState *d,
 static void pscnv_execute_obj_eng_new(PscnvState *d,
                                     volatile struct pscnv_obj_eng_new_cmd *cmd)
 {
+    uint32_t cid;
+
+    if (cmd->cid >= PSCNV_VIRT_CHAN_COUNT
+            || d->chan_handle[cmd->cid] == (uint32_t)-1) {
+        fprintf(stderr, "pscnv_virt: pscnv_execute_obj_eng_new invalid cid %d\n", cmd->cid);
+        cmd->command = PSCNV_RESULT_ERROR;
+        return;
+    }
+    cid = d->chan_handle[cmd->cid];
 #ifdef DUMP_HYPERCALLS
-    fprintf(stderr, "pscnv_obj_eng_new: %d 0x%x 0x%x 0x%x\n",
-            cmd->cid, cmd->handle, cmd->oclass, cmd->flags);
+    fprintf(stderr, "pscnv_obj_eng_new: %d (%d) 0x%x 0x%x 0x%x\n",
+            cid, cmd->cid, cmd->handle, cmd->oclass, cmd->flags);
 #endif
-    cmd->ret = pscnv_obj_eng_new(d->drm_fd, cmd->cid, cmd->handle, cmd->oclass,
+    cmd->ret = pscnv_obj_eng_new(d->drm_fd, cid, cmd->handle, cmd->oclass,
                                  cmd->flags);
     cmd->command = PSCNV_RESULT_NO_ERROR;
 }
@@ -561,11 +620,20 @@ static void pscnv_execute_obj_eng_new(PscnvState *d,
 static void pscnv_execute_fifo_init(PscnvState *d,
                                     volatile struct pscnv_fifo_init_cmd *cmd)
 {
+    uint32_t cid;
+
+    if (cmd->cid >= PSCNV_VIRT_CHAN_COUNT
+            || d->chan_handle[cmd->cid] == (uint32_t)-1) {
+        fprintf(stderr, "pscnv_virt: pscnv_execute_fifo_init invalid cid %d\n", cmd->cid);
+        cmd->command = PSCNV_RESULT_ERROR;
+        return;
+    }
+    cid = d->chan_handle[cmd->cid];
 #ifdef DUMP_HYPERCALLS
-    fprintf(stderr, "pscnv_fifo_init: %d 0x%x 0x%x 0x%x 0x%"PRIx64"\n",
-            cmd->cid, cmd->pb_handle, cmd->flags, cmd->slimask, cmd->pb_start);
+    fprintf(stderr, "pscnv_fifo_init: %d (%d) 0x%x 0x%x 0x%x 0x%"PRIx64"\n",
+            cid, cmd->cid, cmd->pb_handle, cmd->flags, cmd->slimask, cmd->pb_start);
 #endif
-    cmd->ret = pscnv_fifo_init(d->drm_fd, cmd->cid, cmd->pb_handle, cmd->flags,
+    cmd->ret = pscnv_fifo_init(d->drm_fd, cid, cmd->pb_handle, cmd->flags,
                                cmd->slimask, cmd->pb_start);
     cmd->command = PSCNV_RESULT_NO_ERROR;
 }
@@ -573,15 +641,26 @@ static void pscnv_execute_fifo_init(PscnvState *d,
 static void pscnv_execute_fifo_init_ib(PscnvState *d,
                                     volatile struct pscnv_fifo_init_ib_cmd *cmd)
 {
+    uint32_t cid;
+
+    if (cmd->cid >= PSCNV_VIRT_CHAN_COUNT
+            || d->chan_handle[cmd->cid] == (uint32_t)-1) {
+        fprintf(stderr, "pscnv_virt: pscnv_execute_fifo_init_ib invalid cid %d\n", cmd->cid);
+        cmd->command = PSCNV_RESULT_ERROR;
+        return;
+    }
+    cid = d->chan_handle[cmd->cid];
 #ifdef DUMP_HYPERCALLS
-    fprintf(stderr, "pscnv_obj_eng_new: %d 0x%x 0x%x 0x%x 0x%"PRIx64" 0x%x\n",
-            cmd->cid, cmd->pb_handle, cmd->flags, cmd->slimask, cmd->ib_start,
+    fprintf(stderr, "pscnv_fifo_init_ib: %d (%d) 0x%x 0x%x 0x%x 0x%"PRIx64" 0x%x\n",
+            cid, cmd->cid, cmd->pb_handle, cmd->flags, cmd->slimask, cmd->ib_start,
             cmd->ib_order);
 #endif
-    cmd->ret = pscnv_fifo_init_ib(d->drm_fd, cmd->cid, cmd->pb_handle,
+    cmd->ret = pscnv_fifo_init_ib(d->drm_fd, cid, cmd->pb_handle,
                                   cmd->flags, cmd->slimask, cmd->ib_start,
                                   cmd->ib_order);
     cmd->command = PSCNV_RESULT_NO_ERROR;
+
+    d->fifo_init[cmd->cid] = *cmd;
 }
 
 static void pscnv_execute_hypercall(PscnvState *d, uint32_t call_addr)
@@ -604,9 +683,9 @@ static void pscnv_execute_hypercall(PscnvState *d, uint32_t call_addr)
     case PSCNV_CMD_MAP:
         pscnv_execute_map(d, (volatile struct pscnv_map_cmd*)call_data);
         break;
-	case PSCNV_CMD_MEM_FREE:
-		pscnv_execute_mem_free(d, (volatile struct pscnv_free_mem_cmd*)call_data);
-		break;
+    case PSCNV_CMD_MEM_FREE:
+        pscnv_execute_mem_free(d, (volatile struct pscnv_free_mem_cmd*)call_data);
+        break;
     case PSCNV_CMD_VSPACE_ALLOC:
         pscnv_execute_vspace_alloc(d, (volatile struct pscnv_vspace_cmd*)call_data);
         break;
@@ -747,13 +826,13 @@ static void pscnv_chan_writeb(void *opaque, target_phys_addr_t addr, uint32_t va
     PscnvState *d = opaque;
     fprintf(stderr, "pscnv_chan_writeb addr=0x" TARGET_FMT_plx" val=0x%02x\n",
             addr, val);
-	*(uint8_t*)((char*)d->chan_bar_memory + addr) = val;
+    *(uint8_t*)((char*)d->chan_bar_memory + addr) = val;
 }
 
 static uint32_t pscnv_chan_readb(void *opaque, target_phys_addr_t addr)
 {
     PscnvState *d = opaque;
-	uint32_t val = *(uint8_t*)((char*)d->chan_bar_memory + addr);
+    uint32_t val = *(uint8_t*)((char*)d->chan_bar_memory + addr);
     fprintf(stderr, "pscnv_chan_readb addr=0x" TARGET_FMT_plx " val=0x%02x\n",
             addr, val & 0xff);
     return val;
@@ -764,7 +843,7 @@ static void pscnv_chan_writew(void *opaque, target_phys_addr_t addr, uint32_t va
     PscnvState *d = opaque;
     fprintf(stderr, "pscnv_chan_writew addr=0x" TARGET_FMT_plx " val=0x%04x\n",
             addr, val);
-	*(uint16_t*)((char*)d->chan_bar_memory + addr) = val;
+    *(uint16_t*)((char*)d->chan_bar_memory + addr) = val;
 }
 
 static uint32_t pscnv_chan_readw(void *opaque, target_phys_addr_t addr)
@@ -781,13 +860,13 @@ static void pscnv_chan_writel(void *opaque, target_phys_addr_t addr, uint32_t va
     PscnvState *d = opaque;
     fprintf(stderr, "pscnv_chan_writel addr=0x" TARGET_FMT_plx" val=0x%08x\n",
             addr, val);
-	*(uint32_t*)((char*)d->chan_bar_memory + addr) = val;
+    *(uint32_t*)((char*)d->chan_bar_memory + addr) = val;
 }
 
 static uint32_t pscnv_chan_readl(void *opaque, target_phys_addr_t addr)
 {
     PscnvState *d = opaque;
-	uint32_t val = *(uint32_t*)((char*)d->chan_bar_memory + addr);
+    uint32_t val = *(uint32_t*)((char*)d->chan_bar_memory + addr);
     fprintf(stderr, "pscnv_chan_readl addr=0x" TARGET_FMT_plx " val=0x%08x\n",
             addr, val);
     return val;
@@ -809,13 +888,13 @@ static void pscnv_vram_writeb(void *opaque, target_phys_addr_t addr, uint32_t va
     PscnvState *d = opaque;
     fprintf(stderr, "pscnv_vram_writeb addr=0x" TARGET_FMT_plx" val=0x%02x\n",
             addr, val);
-	*(uint8_t*)((char*)d->vram_bar_memory + addr) = val;
+    *(uint8_t*)((char*)d->vram_bar_memory + addr) = val;
 }
 
 static uint32_t pscnv_vram_readb(void *opaque, target_phys_addr_t addr)
 {
     PscnvState *d = opaque;
-	uint32_t val = *(uint8_t*)((char*)d->vram_bar_memory + addr);
+    uint32_t val = *(uint8_t*)((char*)d->vram_bar_memory + addr);
     fprintf(stderr, "pscnv_vram_readb addr=0x" TARGET_FMT_plx " val=0x%02x\n",
             addr, val & 0xff);
     return val;
@@ -826,7 +905,7 @@ static void pscnv_vram_writew(void *opaque, target_phys_addr_t addr, uint32_t va
     PscnvState *d = opaque;
     fprintf(stderr, "pscnv_vram_writew addr=0x" TARGET_FMT_plx " val=0x%04x\n",
             addr, val);
-	*(uint16_t*)((char*)d->vram_bar_memory + addr) = val;
+    *(uint16_t*)((char*)d->vram_bar_memory + addr) = val;
 }
 
 static uint32_t pscnv_vram_readw(void *opaque, target_phys_addr_t addr)
@@ -843,13 +922,13 @@ static void pscnv_vram_writel(void *opaque, target_phys_addr_t addr, uint32_t va
     PscnvState *d = opaque;
     fprintf(stderr, "pscnv_vram_writel addr=0x" TARGET_FMT_plx" val=0x%08x\n",
             addr, val);
-	*(uint32_t*)((char*)d->vram_bar_memory + addr) = val;
+    *(uint32_t*)((char*)d->vram_bar_memory + addr) = val;
 }
 
 static uint32_t pscnv_vram_readl(void *opaque, target_phys_addr_t addr)
 {
     PscnvState *d = opaque;
-	uint32_t val = *(uint32_t*)((char*)d->vram_bar_memory + addr);
+    uint32_t val = *(uint32_t*)((char*)d->vram_bar_memory + addr);
     fprintf(stderr, "pscnv_vram_readl addr=0x" TARGET_FMT_plx " val=0x%08x\n",
             addr, val);
     return val;
@@ -876,6 +955,284 @@ static void pci_physical_memory_read(void *dma_opaque, target_phys_addr_t addr,
 {
     pci_dma_read(dma_opaque, addr, buf, len);
 }*/
+
+static void pscnv_resume_channels(PscnvState *d) {
+    int ret;
+    int i;
+    char *current_channel;
+    unsigned int chsize;
+
+    /**
+     * Reallocate all channels.
+     */
+    chsize = d->is_nv50 ? 0x2000 : 0x1000;
+    current_channel = d->channel_content;
+    for (i = 0; i < PSCNV_VIRT_CHAN_COUNT; i++) {
+        if (chan_is_allocated(d, i)) {
+            fprintf(stderr, "pscnv_save_cancel: Allocating channel %d.\n", i);
+            uint64_t map_handle;
+            void *chmem;
+            /* create a new channel */
+            ret = pscnv_chan_new(d->drm_fd, d->chan_vspace[i],
+                                 &d->chan_handle[i], &map_handle);
+            if (ret) {
+                fprintf(stderr, "pscnv_virt: pscnv_chan_new failed (%d)\n", ret);
+            }
+            if (d->chan_handle[i] >= PSCNV_VIRT_CHAN_COUNT) {
+                fprintf(stderr, "pscnv_virt: Bug: invalid cid %d\n",
+                        d->chan_handle[i]);
+                return;
+            }
+            /* map the channel */
+            chmem = mmap(d->chan_bar_memory + i * chsize, chsize,
+                         PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
+                         d->drm_fd, map_handle);
+            if (chmem == MAP_FAILED) {
+                fprintf(stderr, "pscnv_virt: Could not map channel %d\n",
+                        d->chan_handle[i]);
+            }
+            /* restore the channel state */
+            memcpy(d->chan_bar_memory + i * chsize, current_channel, chsize);
+            if (d->fifo_init[i].command != (uint32_t)-1) {
+                struct pscnv_fifo_init_ib_cmd *cmd = &d->fifo_init[i];
+                ret = pscnv_fifo_init_ib(d->drm_fd, d->chan_handle[i], cmd->pb_handle,
+                                         cmd->flags, cmd->slimask, cmd->ib_start,
+                                         cmd->ib_order);
+                if (ret) {
+                    fprintf(stderr, "pscnv_virt: pscnv_fifo_init_ib failed (%d)\n", ret);
+                }
+            }
+            current_channel += chsize;
+        }
+    }
+}
+
+static void pscnv_revert_migration_mappings(PscnvState *d) {
+    int i;
+    void *mmap_result;
+
+    // Copy changed memory content from RAM to GPU
+    for (i = 0; i < d->alloc_count; i++) {
+        struct pscnv_memory_allocation *obj = &d->alloc_data[i];
+        if (obj->size != (uint64_t)-1) {
+            if (obj->migration_mapping != NULL && obj->mapping != NULL) {
+                memcpy(d->vram_bar_memory + obj->mapping->start,
+                       obj->migration_mapping, obj->size);
+            }
+        }
+    }
+    // Unmap copies made for migration
+    mmap_result = mmap(d->vram_bar_memory, PSCNV_VIRT_VRAM_SIZE, PROT_NONE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (mmap_result == MAP_FAILED) {
+        fprintf(stderr, "pscnv_virt: could not unmap vram\n");
+    }
+    // Map objects into the VRAM BAR again
+    for (i = 0; i < d->alloc_count; i++) {
+        struct pscnv_memory_allocation *obj = &d->alloc_data[i];
+        if (obj->size != (uint64_t)-1) {
+            if (obj->migration_mapping != NULL) {
+                if (munmap(obj->migration_mapping, obj->size) != 0) {
+                    fprintf(stderr, "pscnv_virt: could not unmap obj %d\n", i);
+                }
+            }
+            obj->migration_mapping = NULL;
+            if (obj->mapping != NULL) {
+                mmap_result = mmap(d->vram_bar_memory + obj->mapping->start, obj->size,
+                        PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, d->drm_fd,
+                        obj->map_handle);
+                if (mmap_result == MAP_FAILED) {
+                    fprintf(stderr, "pscnv_virt: could not map obj %d\n", i);
+                }
+            }
+        }
+    }
+}
+
+static void pscnv_save_state(QEMUFile *f, void *opaque) {
+    fprintf(stderr, "pscnv_save_state\n");
+    // TODO
+}
+static int pscnv_save_live_setup(QEMUFile *f, void *opaque) {
+    int i;
+    unsigned int chsize;
+    PscnvState *d = opaque;
+    unsigned int channel_count;
+    char *current_channel;
+    void *mmap_result;
+    int ret;
+
+    fprintf(stderr, "pscnv_save_live_setup\n");
+
+    /**
+     * Idle all channels.
+     */
+    channel_count = 0;
+    chsize = d->is_nv50 ? 0x2000 : 0x1000;
+    for (i = 0; i < PSCNV_VIRT_CHAN_COUNT; i++) {
+        if (chan_is_allocated(d, i)) {
+            uint32_t *channel = (uint32_t*)(d->chan_bar_memory + i * chsize);
+            fprintf(stderr, "dma put: %08x get: %08x\n"
+                            "ib put: %08x get: %08x\n",
+                    channel[0x10], channel[0x11], channel[0x22], channel[0x23]);
+            while (channel[0x10] != channel[0x11] || channel[0x22] != channel[0x23]) {
+                // busy-loop until the channel is idle
+            }
+            channel_count++;
+        }
+    }
+
+    /**
+     * Save the channel content and unmap the channels.
+     */
+    d->channel_content = malloc(chsize * channel_count);
+    current_channel = d->channel_content;
+    for (i = 0; i < PSCNV_VIRT_CHAN_COUNT; i++) {
+        if (chan_is_allocated(d, i)) {
+            fprintf(stderr, "pscnv_save_cancel: Deleting channel %d.\n", i);
+            memcpy(current_channel, d->chan_bar_memory + i * chsize, chsize);
+            /* delete the channel */
+            ret = pscnv_chan_free(d->drm_fd, d->chan_handle[i]);
+            if (ret) {
+                fprintf(stderr, "pscnv_virt: could not free channel (%d)\n", ret);
+            }
+            /* unmap the channel */
+            mmap_result = mmap(d->chan_bar_memory + i * chsize, chsize,
+                    PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            if (mmap_result == MAP_FAILED) {
+                fprintf(stderr, "pscnv_virt: could not unmap channel %d\n", i);
+            }
+            current_channel += chsize;
+        }
+    }
+    mmap_result = mmap(d->chan_bar_memory, d->chan_bar_size,
+                       PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (mmap_result == MAP_FAILED) {
+        fprintf(stderr, "pscnv_virt: could not unmap channels\n");
+        return -1;
+    }
+
+    /**
+     * Map GPU memory contents.
+     */
+    // TODO: DMA
+    /*for (i = 0; i < d->alloc_count; i++) {
+        struct pscnv_memory_allocation *obj = &d->alloc_data[i];
+        if (obj->size != (uint64_t)-1) {
+            if (obj->mapping != NULL) {
+                obj->migration_mapping = NULL;
+            } else {
+                obj->migration_mapping =
+                        mmap(NULL, obj->size, PROT_READ | PROT_WRITE,
+                             MAP_SHARED, d->drm_fd, obj->map_handle);
+                if (obj->migration_mapping == MAP_FAILED) {
+                    fprintf(stderr, "pscnv_virt: could not map obj %d\n", i);
+                    return -1;
+                }
+            }
+        }
+    }*/
+    mmap_result = mmap(d->vram_bar_memory, PSCNV_VIRT_VRAM_SIZE,
+                       PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (mmap_result == MAP_FAILED) {
+        fprintf(stderr, "pscnv_virt: could not unmap vram\n");
+        return -1;
+    }
+    for (i = 0; i < d->alloc_count; i++) {
+        struct pscnv_memory_allocation *obj = &d->alloc_data[i];
+        if (obj->size != (uint64_t)-1) {
+            obj->migration_mapping =
+                    mmap(NULL, obj->size, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, d->drm_fd, obj->map_handle);
+            if (obj->migration_mapping == MAP_FAILED) {
+                fprintf(stderr, "pscnv_virt: could not map obj %d\n", i);
+                return -1;
+            }
+            if (obj->mapping != NULL) {
+                memcpy(d->vram_bar_memory + obj->mapping->start,
+                       obj->migration_mapping, obj->size);
+            }
+        }
+    }
+
+    /**
+     * We just let the normal RAM migration code take care of mapped buffers.
+     */
+    /*memory_region_set_log(&d->vram_bar, 1, DIRTY_MEMORY_PSCNV);
+    memory_region_set_dirty(&d->vram_bar, 0, PSCNV_VIRT_VRAM_SIZE);
+    memory_region_sync_dirty_bitmap(&d->vram_bar);*/
+
+    // TODO
+
+    /**
+     * Start copying memory.
+     */
+    // TODO
+    return 0;
+}
+static int pscnv_save_live_iterate(QEMUFile *f, void *opaque) {
+    fprintf(stderr, "pscnv_save_live_iterate\n");
+    // TODO
+    return 1;
+}
+static int pscnv_save_live_complete(QEMUFile *f, void *opaque) {
+    int i;
+    PscnvState *d = opaque;
+
+    fprintf(stderr, "pscnv_save_live_complete\n");
+
+    //memory_region_sync_dirty_bitmap(&d->vram_bar);
+
+    /**
+     * Write memory into the buffer.
+     */
+    for (i = 0; i < d->alloc_count; i++) {
+        struct pscnv_memory_allocation *obj = &d->alloc_data[i];
+        void *data;
+        if (obj->size != (uint64_t)-1) {
+            /*if (obj->mapping != NULL) {
+                data = d->vram_bar_memory + obj->mapping->start;
+            } else {
+                data = obj->migration_mapping;
+            }*/
+            data = obj->migration_mapping;
+            qemu_put_be32(f, obj->size);
+            qemu_put_buffer(f, data, obj->size);
+        }
+    }
+
+    /**
+     * Revert all changes made by the migration functions.
+     */
+    pscnv_revert_migration_mappings(d);
+    pscnv_resume_channels(d);
+    return 0;
+}
+static void pscnv_save_cancel(void *opaque) {
+    PscnvState *d = opaque;
+
+    fprintf(stderr, "pscnv_save_cancel\n");
+
+    pscnv_revert_migration_mappings(d);
+    pscnv_resume_channels(d);
+}
+static int pscnv_load_state(QEMUFile *f, void *opaque, int version_id) {
+    fprintf(stderr, "pscnv_load_state\n");
+    // TODO
+    return -1;
+}
+
+static SaveVMHandlers pscnv_save_handlers = {
+    .save_state = pscnv_save_state,
+    .save_live_setup = pscnv_save_live_setup,
+    .save_live_iterate = pscnv_save_live_iterate,
+    .save_live_complete = pscnv_save_live_complete,
+    .cancel = pscnv_save_cancel,
+    .load_state = pscnv_load_state,
+};
+
 
 static void pci_pscnv_uninit(PCIDevice *dev)
 {
@@ -953,7 +1310,7 @@ static int pci_pscnv_init(PCIDevice *pci_dev)
     d->gpu_info[PSCNV_INFO_MP_COUNT] =
             read_gpu_info(d, /*PSCNV_GETPARAM_MP_COUNT*/ 100);
 
-	/* allocation struct freelist */
+    /* allocation struct freelist */
     d->alloc_data = calloc(sizeof(struct pscnv_memory_allocation), 16);
     d->alloc_count = 16;
     d->alloc_freelist = 0;
@@ -1032,15 +1389,23 @@ static int pci_pscnv_init(PCIDevice *pci_dev)
 #endif
     pci_register_bar(pci_dev, 3, 0, &d->chan_bar);
 
-	/* mark the whole bar as free */
-	struct pscnv_memory_area *memory_area = malloc(sizeof(*memory_area));
-	memory_area->start = 0;
-	memory_area->size = PSCNV_VIRT_VRAM_SIZE;
-	memory_area->next = memory_area->prev = NULL;
-	memory_area->handle = (uint32_t)-1;
-	d->memory_areas = memory_area;
+    /* mark the whole bar as free */
+    struct pscnv_memory_area *memory_area = malloc(sizeof(*memory_area));
+    memory_area->start = 0;
+    memory_area->size = PSCNV_VIRT_VRAM_SIZE;
+    memory_area->next = memory_area->prev = NULL;
+    memory_area->handle = (uint32_t)-1;
+    d->memory_areas = memory_area;
 
     /*d->irq = pci_dev->irq[0];*/
+
+    /* no channels have been allocated yet */
+    memset(d->chan_handle, -1, sizeof(d->chan_handle));
+    memset(d->fifo_init, -1, sizeof(d->fifo_init));
+
+    /* install the handlers needed for migration */
+    register_savevm_live(&pci_dev->qdev, "pscnv_virt", -1, 1,
+                         &pscnv_save_handlers, d);
 
     return 0;
 }

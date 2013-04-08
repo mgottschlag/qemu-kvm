@@ -37,6 +37,7 @@ typedef struct MemoryRegionMmio MemoryRegionMmio;
 #define DIRTY_MEMORY_VGA       0
 #define DIRTY_MEMORY_CODE      1
 #define DIRTY_MEMORY_MIGRATION 3
+#define DIRTY_MEMORY_PSCNV     4
 
 struct MemoryRegionMmio {
     CPUReadMemoryFunc *read[3];
