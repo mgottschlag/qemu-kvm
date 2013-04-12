@@ -5,6 +5,7 @@
 #include "pci.h"
 #include "exec-memory.h"
 #include "vmstate.h"
+#include "qemu-thread.h"
 
 #define PAGE_SHIFT 12
 #define PAGE_SIZE (1 << PAGE_SHIFT)
@@ -169,6 +170,20 @@ struct pscnv_obj_eng_new_cmd {
     int32_t ret;
 };
 
+enum pscnv_migration_log_type {
+    PSCNV_MIGRATION_LOG_ALLOC = 1,
+    PSCNV_MIGRATION_LOG_FREE = 2,
+    PSCNV_MIGRATION_LOG_MAP = 4,
+    PSCNV_MIGRATION_LOG_UNMAP = 8
+};
+
+struct pscnv_migration_log_entry {
+    struct pscnv_migration_log_entry *next;
+    struct pscnv_migration_log_entry *prev;
+    enum pscnv_migration_log_type type;
+    uint32_t handle;
+};
+
 typedef struct {
     PCIDevice pci_dev;
     MemoryRegion mmio_bar;
@@ -194,9 +209,19 @@ typedef struct {
     struct pscnv_memory_area *memory_areas;
 
     int is_nv50;
+
+    int migration_active;
+    QemuMutex migration_log_lock;
+    struct pscnv_migration_log_entry *migration_log_start;
+    struct pscnv_migration_log_entry *migration_log_end;
 } PscnvState;
 
 extern SaveVMHandlers pscnv_save_handlers;
+
+int pscnv_remove_migration_log_entries(PscnvState *d, uint32_t handle,
+                                        int type_mask);
+void pscnv_add_migration_log_entry(PscnvState *d, uint32_t handle,
+                                  enum pscnv_migration_log_type type);
 
 #endif
 

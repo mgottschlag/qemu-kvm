@@ -112,6 +112,13 @@ static void pscnv_execute_mem_alloc(PscnvState *d,
 #endif
 
     cmd->command = PSCNV_RESULT_NO_ERROR;
+
+    /* add an entry into the migration log if necessary */
+    if (d->migration_active) {
+        qemu_mutex_lock(&d->migration_log_lock);
+        pscnv_add_migration_log_entry(d, cmd->handle, PSCNV_MIGRATION_LOG_ALLOC);
+        qemu_mutex_unlock(&d->migration_log_lock);
+    }
 }
 
 static void pscnv_execute_map(PscnvState *d,
@@ -148,15 +155,29 @@ static void pscnv_execute_map(PscnvState *d,
     }
     obj->mapping->handle = cmd->handle;
     /* map the gem object */
-    /* TODO: access rights? */
-    mapped = mmap(d->vram_bar_memory + obj->mapping->start, obj->size,
-            PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, d->drm_fd,
-            obj->map_handle);
-    if (((uintptr_t)mapped & PAGE_MASK) != 0) {
-        fprintf(stderr, "pscnv_virt: mapped data not page-aligned: %p\n",
-                mapped);
-        cmd->command = PSCNV_RESULT_ERROR;
-        return;
+    if (d->migration_active == 0) {
+        /* TODO: access rights? */
+        mapped = mmap(d->vram_bar_memory + obj->mapping->start, obj->size,
+                PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, d->drm_fd,
+                obj->map_handle);
+        if (((uintptr_t)mapped & PAGE_MASK) != 0) {
+            fprintf(stderr, "pscnv_virt: mapped data not page-aligned: %p\n",
+                    mapped);
+            cmd->command = PSCNV_RESULT_ERROR;
+            return;
+        }
+    } else {
+        obj->migration_mapping = mmap(NULL, obj->size,
+                PROT_READ | PROT_WRITE, MAP_SHARED, d->drm_fd,
+                obj->map_handle);
+        if (obj->migration_mapping == MAP_FAILED) {
+            fprintf(stderr, "pscnv_virt: could not map obj: %d\n",
+                    cmd->handle);
+            cmd->command = PSCNV_RESULT_ERROR;
+            return;
+        }
+        memcpy(d->vram_bar_memory + obj->mapping->start,
+               obj->migration_mapping, obj->size);
     }
 #ifdef DUMP_HYPERCALLS
         fprintf(stderr, "pscnv_virt: mapped %d to %x\n",
@@ -164,6 +185,13 @@ static void pscnv_execute_map(PscnvState *d,
 #endif
     cmd->start = obj->mapping->start;
     cmd->command = PSCNV_RESULT_NO_ERROR;
+
+    /* add an entry into the migration log if necessary */
+    if (d->migration_active) {
+        qemu_mutex_lock(&d->migration_log_lock);
+        pscnv_add_migration_log_entry(d, cmd->handle, PSCNV_MIGRATION_LOG_MAP);
+        qemu_mutex_unlock(&d->migration_log_lock);
+    }
 }
 
 static void pscnv_execute_mem_free(PscnvState *d,
@@ -198,6 +226,21 @@ static void pscnv_execute_mem_free(PscnvState *d,
     d->alloc_freelist = cmd->handle;
 
     cmd->command = PSCNV_RESULT_NO_ERROR;
+
+    /* add an entry into the migration log if necessary */
+    if (d->migration_active) {
+        int removed;
+        qemu_mutex_lock(&d->migration_log_lock);
+        removed = pscnv_remove_migration_log_entries(d, cmd->handle,
+                                                     PSCNV_MIGRATION_LOG_ALLOC |
+                                                     PSCNV_MIGRATION_LOG_MAP |
+                                                     PSCNV_MIGRATION_LOG_UNMAP);
+        if ((removed & PSCNV_MIGRATION_LOG_ALLOC) != 0) {
+            pscnv_add_migration_log_entry(d, cmd->handle,
+                                          PSCNV_MIGRATION_LOG_FREE);
+        }
+        qemu_mutex_unlock(&d->migration_log_lock);
+    }
 }
 static void pscnv_execute_vspace_alloc(PscnvState *d,
                                        volatile struct pscnv_vspace_cmd *cmd)
@@ -300,27 +343,35 @@ static void pscnv_execute_chan_new(PscnvState *d,
 #ifdef DUMP_HYPERCALLS
     fprintf(stderr, "pscnv_chan_new: %d\n", cmd->vid);
 #endif
-    ret = pscnv_chan_new(d->drm_fd, cmd->vid, &cid, &map_handle);
-    if (ret) {
-        fprintf(stderr, "pscnv_virt: pscnv_chan_new failed (%d)\n", ret);
-        cmd->command = PSCNV_RESULT_ERROR;
-        return;
-    }
-    if (cid >= PSCNV_VIRT_CHAN_COUNT) {
-        fprintf(stderr, "pscnv_virt: Bug: invalid cid %d\n", cid);
-        cmd->command = PSCNV_RESULT_ERROR;
-        return;
-    }
-    /* map the channel into the channel BAR */
-    chan_index = allocate_chan(d);
-    assert(chan_index < PSCNV_VIRT_CHAN_COUNT);
-    chsize = d->is_nv50 ? 0x2000 : 0x1000;
-    chmem = mmap(d->chan_bar_memory + chan_index * chsize, chsize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, d->drm_fd,
-                 map_handle);
-    if (chmem == MAP_FAILED) {
-        fprintf(stderr, "pscnv_virt: Could not map channel %d\n", cid);
-        cmd->command = PSCNV_RESULT_ERROR;
-        return;
+    if (d->migration_active == 0) {
+        ret = pscnv_chan_new(d->drm_fd, cmd->vid, &cid, &map_handle);
+        if (ret) {
+            fprintf(stderr, "pscnv_virt: pscnv_chan_new failed (%d)\n", ret);
+            cmd->command = PSCNV_RESULT_ERROR;
+            return;
+        }
+        if (cid >= PSCNV_VIRT_CHAN_COUNT) {
+            fprintf(stderr, "pscnv_virt: Bug: invalid cid %d\n", cid);
+            cmd->command = PSCNV_RESULT_ERROR;
+            return;
+        }
+        /* map the channel into the channel BAR */
+        chan_index = allocate_chan(d);
+        assert(chan_index < PSCNV_VIRT_CHAN_COUNT);
+        chsize = d->is_nv50 ? 0x2000 : 0x1000;
+        chmem = mmap(d->chan_bar_memory + chan_index * chsize, chsize,
+                     PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, d->drm_fd,
+                     map_handle);
+        if (chmem == MAP_FAILED) {
+            fprintf(stderr, "pscnv_virt: Could not map channel %d\n", cid);
+            cmd->command = PSCNV_RESULT_ERROR;
+            return;
+        }
+    } else {
+        chan_index = allocate_chan(d);
+        cid = 0;
+        chsize = d->is_nv50 ? 0x2000 : 0x1000;
+        memset(d->chan_bar_memory + chan_index * chsize, 0, chsize);
     }
     d->chan_handle[chan_index] = cid;
     d->chan_vspace[chan_index] = cmd->vid;
@@ -351,22 +402,24 @@ static void pscnv_execute_chan_free(PscnvState *d,
 #ifdef DUMP_HYPERCALLS
     fprintf(stderr, "pscnv_chan_free: %d (%d)\n", cid, cmd->cid);
 #endif
-    /* delete that channel */
-    ret = pscnv_chan_free(d->drm_fd, cid);
-    if (ret) {
-        fprintf(stderr, "pscnv_virt: pscnv_chan_free failed (%d)\n", ret);
-        cmd->command = PSCNV_RESULT_ERROR;
-        return;
-    }
+    if (d->migration_active == 0) {
+        /* delete that channel */
+        ret = pscnv_chan_free(d->drm_fd, cid);
+        if (ret) {
+            fprintf(stderr, "pscnv_virt: pscnv_chan_free failed (%d)\n", ret);
+            cmd->command = PSCNV_RESULT_ERROR;
+            return;
+        }
 
-    /* unmap the channel */
-    chsize = d->is_nv50 ? 0x2000 : 0x1000;
-    chmem = mmap(d->chan_bar_memory + cmd->cid * chsize, chsize, PROT_NONE,
-                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-    if (chmem == MAP_FAILED) {
-        fprintf(stderr, "pscnv_virt: could not unmap channel %d\n", cmd->cid);
-        cmd->command = PSCNV_RESULT_ERROR;
-        return;
+        /* unmap the channel */
+        chsize = d->is_nv50 ? 0x2000 : 0x1000;
+        chmem = mmap(d->chan_bar_memory + cmd->cid * chsize, chsize, PROT_NONE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        if (chmem == MAP_FAILED) {
+            fprintf(stderr, "pscnv_virt: could not unmap channel %d\n", cmd->cid);
+            cmd->command = PSCNV_RESULT_ERROR;
+            return;
+        }
     }
 
     d->chan_handle[cmd->cid] = (uint32_t)-1;
@@ -455,9 +508,11 @@ static void pscnv_execute_fifo_init_ib(PscnvState *d,
             cid, cmd->cid, cmd->pb_handle, cmd->flags, cmd->slimask, cmd->ib_start,
             cmd->ib_order);
 #endif
-    cmd->ret = pscnv_fifo_init_ib(d->drm_fd, cid, cmd->pb_handle,
-                                  cmd->flags, cmd->slimask, cmd->ib_start,
-                                  cmd->ib_order);
+    if (d->migration_active == 0) {
+        cmd->ret = pscnv_fifo_init_ib(d->drm_fd, cid, cmd->pb_handle,
+                                      cmd->flags, cmd->slimask, cmd->ib_start,
+                                      cmd->ib_order);
+    }
     cmd->command = PSCNV_RESULT_NO_ERROR;
 
     d->fifo_init[cmd->cid] = *cmd;
@@ -928,9 +983,10 @@ static int pci_pscnv_init(PCIDevice *pci_dev)
     /* install the handlers needed for migration */
     register_savevm_live(&pci_dev->qdev, "pscnv_virt", -1, 1,
                          &pscnv_save_handlers, d);
-	qemu_mutex_init(&d->migration_log_lock);
-	d->migration_log_start = NULL;
-	d->migration_log_end = NULL;
+    qemu_mutex_init(&d->migration_log_lock);
+    d->migration_log_start = NULL;
+    d->migration_log_end = NULL;
+    d->migration_active = 0;
 
     return 0;
 }

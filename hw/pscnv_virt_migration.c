@@ -289,3 +289,42 @@ SaveVMHandlers pscnv_save_handlers = {
     .load_state = pscnv_load_state,
 };
 
+int pscnv_remove_migration_log_entries(PscnvState *d, uint32_t handle,
+                                        int type_mask) {
+    int removed = 0;
+    struct pscnv_migration_log_entry *entry = d->migration_log_start;
+    while (entry != NULL) {
+        if (entry->handle == handle && (entry->type & type_mask) != 0) {
+            struct pscnv_migration_log_entry *next = entry->next;
+            if (entry->next != NULL) {
+                entry->next->prev = entry->prev;
+            } else {
+                d->migration_log_end = entry->prev;
+            }
+            if (entry->prev != NULL) {
+                entry->prev->next = entry->next;
+            } else {
+                d->migration_log_start = entry->next;
+            }
+            removed |= entry->type;
+            free(entry);
+            entry = next;
+        }
+    }
+    return removed;
+}
+void pscnv_add_migration_log_entry(PscnvState *d, uint32_t handle,
+                                   enum pscnv_migration_log_type type) {
+    struct pscnv_migration_log_entry *entry = malloc(sizeof(*entry));
+    entry->prev = d->migration_log_end;
+    entry->next = NULL;
+    if (d->migration_log_end != NULL) {
+        d->migration_log_end->next = entry;
+    } else {
+        d->migration_log_start = entry;
+    }
+    d->migration_log_end = entry;
+    entry->type = type;
+    entry->handle = handle;
+}
+
