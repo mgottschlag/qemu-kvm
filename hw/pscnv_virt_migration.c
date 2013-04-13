@@ -4,6 +4,105 @@
 #include <libpscnv.h>
 #include <sys/mman.h>
 
+#define PSCNV_SAVE_EOS 0x1
+#define PSCNV_SAVE_ALLOC 0x2
+#define PSCNV_SAVE_FREE 0x3
+#define PSCNV_SAVE_MAP 0x4
+#define PSCNV_SAVE_UNMAP 0x5
+#define PSCNV_SAVE_VSPACE 0x6
+#define PSCNV_SAVE_VSPACE_MAP 0x7
+#define PSCNV_SAVE_CHAN 0x8
+#define PSCNV_SAVE_FINISH 0x9
+
+
+static int add_allocation_entry_fixed(PscnvState *d, uint32_t handle,
+                                      struct pscnv_memory_allocation *entry) {
+    while (handle >= d->alloc_count) {
+        /* allocate new entries */
+        uint32_t i;
+        uint32_t new_count = d->alloc_count * 2;
+        d->alloc_data = realloc(d->alloc_data,
+                new_count * sizeof(struct pscnv_memory_allocation));
+        for (i = d->alloc_count; i < new_count; i++) {
+            d->alloc_data[i].size = 0xffffffffffffffff;
+            d->alloc_data[i].next = i + 1;
+        }
+        d->alloc_data[new_count - 1].next = d->alloc_freelist;
+        d->alloc_freelist = d->alloc_count;
+        d->alloc_count = new_count;
+    }
+    /* search for an existing free entry */
+    if (d->alloc_freelist == -1) {
+        return -1;
+    }
+    if (d->alloc_freelist == handle) {
+        d->alloc_freelist = d->alloc_data[handle].next;
+    } else {
+        uint32_t prev = d->alloc_freelist;
+        uint32_t curr = d->alloc_data[prev].next;
+        while (curr != handle) {
+            if (curr == -1) {
+                return -1;
+            }
+            prev = curr;
+            curr = d->alloc_data[prev].next;
+        }
+        d->alloc_data[prev].next = d->alloc_data[handle].next;
+    }
+    /* set the content of the entry */
+    d->alloc_data[handle] = *entry;
+    return 0;
+}
+
+static struct pscnv_memory_area *add_mapping_entry_fixed(PscnvState *d,
+                                                         uint32_t start,
+                                                         uint32_t size) {
+    struct pscnv_memory_area *area = d->memory_areas;
+    while (area != NULL) {
+        if (area->start > start) {
+            return NULL;
+        }
+        if (area->start + area->size >= start + size) {
+            break;
+        }
+        area = area->next;
+    }
+    if (area == NULL) {
+        return NULL;
+    }
+    if (area->handle != (uint32_t)-1) {
+        return NULL;
+    }
+    if (area->start != start) {
+        struct pscnv_memory_area *prev = malloc(sizeof(*prev));
+        prev->prev = area->prev;
+        prev->next = area;
+        prev->start = area->start;
+        prev->size = start - area->start;
+        prev->handle = -1;
+        if (area->prev != NULL) {
+            area->prev->next = prev;
+        }
+        area->prev = prev;
+        area->size -= start - area->start;
+        area->start = start;
+    }
+    if (area->size != size) {
+        struct pscnv_memory_area *next = malloc(sizeof(*next));
+        next->prev = area;
+        next->next = area->next;
+        next->start = start + size;
+        next->size = area->size - size;
+        next->handle = -1;
+        if (area->next != NULL) {
+            area->next->prev = next;
+        }
+        area->next = next;
+        area->size = size;
+    }
+    return area;
+}
+
 /**
  * Checks whether an entry in the chan memory region is associated with a
  * pscnv channel.
@@ -105,9 +204,81 @@ static void pscnv_revert_migration_mappings(PscnvState *d) {
     }
 }
 
+/**
+ * Returns 0 if no log entry was available.
+ */
+static int pscnv_save_log_entry(PscnvState *d, QEMUFile *f) {
+    struct pscnv_migration_log_entry *tmp;
+    struct pscnv_migration_log_entry entry;
+    struct pscnv_memory_allocation obj;
+    struct pscnv_memory_area mapping;
+    void *buffer_data = NULL;
+
+    qemu_mutex_lock(&d->migration_log_lock);
+    /* check whether the log is empty */
+    if (d->migration_log_start == NULL) {
+        qemu_mutex_unlock(&d->migration_log_lock);
+        return 0;
+    }
+    /* remove one entry from the log */
+    tmp = d->migration_log_start;
+    entry = *tmp;
+    if (tmp->next != NULL) {
+        tmp->next->prev = NULL;
+    }
+    d->migration_log_start = tmp->next;
+    // TODO: this is not thread-safe!
+    obj = d->alloc_data[entry.handle];
+    if (obj.mapping) {
+        mapping = *obj.mapping;
+    }
+    /* for allocation entries we also need to map the buffer in case it is
+     * deleted later */
+    if (entry.type == PSCNV_MIGRATION_LOG_ALLOC) {
+        buffer_data = mmap(NULL, obj.size, PROT_READ | PROT_WRITE,
+                           MAP_SHARED, d->drm_fd, obj.map_handle);
+        assert(buffer_data != MAP_FAILED);
+    }
+    qemu_mutex_unlock(&d->migration_log_lock);
+
+    if (entry.type == PSCNV_MIGRATION_LOG_ALLOC) {
+        qemu_put_byte(f, PSCNV_SAVE_ALLOC);
+        qemu_put_be32(f, entry.handle);
+        qemu_put_be64(f, obj.size);
+        qemu_put_be32(f, obj.cookie);
+        qemu_put_be32(f, obj.flags);
+        qemu_put_be32(f, obj.tile_flags);
+        qemu_put_byte(f, obj.mapping != NULL);
+        fprintf(stderr, "ALLOC %x %x %x %x %"PRIx64"\n", entry.handle,
+                obj.cookie, obj.flags, obj.tile_flags, obj.size);
+        if (obj.mapping == NULL) {
+            qemu_put_buffer(f, buffer_data, obj.size);
+        } else {
+            qemu_put_be32(f, mapping.start);
+            qemu_put_be32(f, mapping.size);
+        }
+        munmap(buffer_data, obj.size);
+    } else if (entry.type == PSCNV_MIGRATION_LOG_FREE) {
+        qemu_put_byte(f, PSCNV_SAVE_FREE);
+        qemu_put_be32(f, entry.handle);
+    } else if (entry.type == PSCNV_MIGRATION_LOG_MAP) {
+        qemu_put_byte(f, PSCNV_SAVE_MAP);
+        qemu_put_be32(f, entry.handle);
+        qemu_put_be32(f, mapping.start);
+        qemu_put_be32(f, mapping.size);
+    } else if (entry.type == PSCNV_MIGRATION_LOG_UNMAP) {
+        qemu_put_byte(f, PSCNV_SAVE_UNMAP);
+        qemu_put_be32(f, entry.handle);
+    }
+
+    return 1;
+}
+
 static void pscnv_save_state(QEMUFile *f, void *opaque) {
     fprintf(stderr, "pscnv_save_state\n");
     // TODO
+    qemu_put_byte(f, PSCNV_SAVE_FINISH);
+    qemu_put_byte(f, PSCNV_SAVE_EOS);
 }
 static int pscnv_save_live_setup(QEMUFile *f, void *opaque) {
     int i;
@@ -119,6 +290,8 @@ static int pscnv_save_live_setup(QEMUFile *f, void *opaque) {
     int ret;
 
     fprintf(stderr, "pscnv_save_live_setup\n");
+
+    d->migration_active = 1;
 
     /**
      * Idle all channels.
@@ -220,50 +393,62 @@ static int pscnv_save_live_setup(QEMUFile *f, void *opaque) {
     memory_region_set_dirty(&d->vram_bar, 0, PSCNV_VIRT_VRAM_SIZE);
     memory_region_sync_dirty_bitmap(&d->vram_bar);*/
 
-    // TODO
-
     /**
-     * Start copying memory.
+     * Add migration log entries for all existing objects so that these are
+     * copied in pscnv_save_live_iterate.
      */
-    // TODO
+    for (i = 0; i < d->alloc_count; i++) {
+        struct pscnv_memory_allocation *obj = &d->alloc_data[i];
+        if (obj->size != (uint64_t)-1) {
+            pscnv_add_migration_log_entry(d, i, PSCNV_MIGRATION_LOG_ALLOC);
+        }
+    }
+
+    qemu_put_byte(f, PSCNV_SAVE_EOS);
+
     return 0;
 }
+
 static int pscnv_save_live_iterate(QEMUFile *f, void *opaque) {
+    int ret;
+    PscnvState *d = opaque;
+
     fprintf(stderr, "pscnv_save_live_iterate\n");
-    // TODO
-    return 1;
+
+    /* transmit all memory buffers */
+    while ((ret = qemu_file_rate_limit(f)) == 0) {
+        if (pscnv_save_log_entry(d, f) == 0) {
+            qemu_put_byte(f, PSCNV_SAVE_EOS);
+            return 1;
+        }
+    }
+    if (ret < 0) {
+        return ret;
+    }
+
+    qemu_put_byte(f, PSCNV_SAVE_EOS);
+
+    return 0;
 }
 static int pscnv_save_live_complete(QEMUFile *f, void *opaque) {
-    int i;
     PscnvState *d = opaque;
 
     fprintf(stderr, "pscnv_save_live_complete\n");
 
-    //memory_region_sync_dirty_bitmap(&d->vram_bar);
+    /* write remaining log entries */
+    while (pscnv_save_log_entry(d, f) != 0);
+    /* TODO: write remaining information about channels and virtual address spaces */
 
-    /**
-     * Write memory into the buffer.
-     */
-    for (i = 0; i < d->alloc_count; i++) {
-        struct pscnv_memory_allocation *obj = &d->alloc_data[i];
-        void *data;
-        if (obj->size != (uint64_t)-1) {
-            /*if (obj->mapping != NULL) {
-                data = d->vram_bar_memory + obj->mapping->start;
-            } else {
-                data = obj->migration_mapping;
-            }*/
-            data = obj->migration_mapping;
-            qemu_put_be32(f, obj->size);
-            qemu_put_buffer(f, data, obj->size);
-        }
-    }
+    qemu_put_byte(f, PSCNV_SAVE_EOS);
 
     /**
      * Revert all changes made by the migration functions.
      */
-    pscnv_revert_migration_mappings(d);
-    pscnv_resume_channels(d);
+    // TODO: this is not necessary!
+    /*pscnv_revert_migration_mappings(d);
+    pscnv_resume_channels(d);*/
+
+    d->migration_active = 0;
     return 0;
 }
 static void pscnv_save_cancel(void *opaque) {
@@ -273,11 +458,100 @@ static void pscnv_save_cancel(void *opaque) {
 
     pscnv_revert_migration_mappings(d);
     pscnv_resume_channels(d);
+
+    d->migration_active = 0;
 }
 static int pscnv_load_state(QEMUFile *f, void *opaque, int version_id) {
+    PscnvState *d = opaque;
+    int ret;
+
     fprintf(stderr, "pscnv_load_state\n");
+
+    while (1) {
+        int type = qemu_get_byte(f);
+        fprintf(stderr, "pscnv_virt: %d\n", type);
+        if (type == PSCNV_SAVE_EOS) {
+            break;
+        } else if (type == PSCNV_SAVE_ALLOC) {
+            struct pscnv_memory_allocation result;
+            uint32_t handle = qemu_get_be32(f);
+            uint64_t size = qemu_get_be64(f);
+            uint32_t cookie = qemu_get_be32(f);
+            uint32_t flags = qemu_get_be32(f);
+            uint32_t tile_flags = qemu_get_be32(f);
+            int mapped = qemu_get_byte(f);
+            void *buffer_data;
+            /* allocate a gem object */
+            fprintf(stderr, "pscnv_gem_new: %x %x %x %x %"PRIx64"\n", handle, cookie,
+                    flags, tile_flags, size);
+            ret = pscnv_gem_new(d->drm_fd, cookie, flags, tile_flags,
+                                size, NULL, &result.handle, &result.map_handle);
+            if (ret != 0) {
+                fprintf(stderr, "pscnv_gem_new failed: %d\n", ret);
+                return -EINVAL;
+            }
+            result.cookie = cookie;
+            result.flags = flags;
+            result.tile_flags = tile_flags;
+            result.size = (size + 0xfff) & ~0xfff;
+            result.mapping = NULL;
+            /* add it at the specified position */
+            if (add_allocation_entry_fixed(d, handle, &result) != 0) {
+                fprintf(stderr, "Could not create allocation entry!\n");
+                return -EINVAL;
+            }
+            /* map it and load the contents if necessary */
+            if (mapped) {
+                uint32_t start = qemu_get_be32(f);
+                uint32_t size = qemu_get_be32(f);
+                d->alloc_data[handle].mapping =
+                        add_mapping_entry_fixed(d, start, size);
+                if (d->alloc_data[handle].mapping == NULL) {
+                    fprintf(stderr, "ALLOC: Invalid memory range.\n");
+                }
+                d->alloc_data[handle].mapping->handle = handle;
+            } else {
+                buffer_data = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                                   MAP_SHARED, d->drm_fd, result.map_handle);
+                assert(buffer_data != MAP_FAILED);
+                qemu_get_buffer(f, buffer_data, size);
+                munmap(buffer_data, size);
+            }
+            // TODO: initially the whole pci memory space must be mapped!
+        } else if (type == PSCNV_SAVE_FREE) {
+            uint32_t handle = qemu_get_be32(f);
+            struct pscnv_memory_allocation *obj = &d->alloc_data[handle];
+            /* free the underlying gpu buffer */
+            pscnv_gem_close(d->drm_fd, obj->handle);
+            /* clear the mapping */
+            if (obj->mapping != NULL) {
+                pscnv_free_memory(d, obj->mapping);
+            }
+            /* free the allocation list entry */
+            obj->next = d->alloc_freelist;
+            d->alloc_freelist = handle;
+        } else if (type == PSCNV_SAVE_MAP) {
+            uint32_t handle = qemu_get_be32(f);
+            uint32_t start = qemu_get_be32(f);
+            uint32_t size = qemu_get_be32(f);
+            d->alloc_data[handle].mapping =
+                    add_mapping_entry_fixed(d, start, size);
+            d->alloc_data[handle].mapping->handle = handle;
+        } else if (type == PSCNV_SAVE_UNMAP) {
+            // TODO
+        } else if (type == PSCNV_SAVE_VSPACE) {
+            // TODO
+        } else if (type == PSCNV_SAVE_VSPACE_MAP) {
+            // TODO
+        } else if (type == PSCNV_SAVE_CHAN) {
+            // TODO
+        } else if (type == PSCNV_SAVE_FINISH) {
+            fprintf(stderr, "pscnv_virt: Done!\n");
+            // TODO
+        }
+    }
     // TODO
-    return -1;
+    return 0;
 }
 
 SaveVMHandlers pscnv_save_handlers = {

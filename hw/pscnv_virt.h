@@ -71,7 +71,9 @@ struct pscnv_memory_allocation {
     uint64_t map_handle;
     uint32_t handle;
     uint32_t next;
-    uint32_t cid;
+    uint32_t cookie;
+    uint32_t flags;
+    uint32_t tile_flags;
     struct pscnv_memory_area *mapping;
     void *migration_mapping;
 };
@@ -222,6 +224,8 @@ int pscnv_remove_migration_log_entries(PscnvState *d, uint32_t handle,
                                         int type_mask);
 void pscnv_add_migration_log_entry(PscnvState *d, uint32_t handle,
                                   enum pscnv_migration_log_type type);
+
+void pscnv_free_memory(PscnvState *d, struct pscnv_memory_area *area);
 
 #endif
 

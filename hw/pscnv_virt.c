@@ -43,7 +43,7 @@ static struct pscnv_memory_area *allocate_memory(PscnvState *d,
     return area;
 }
 
-static void free_memory(PscnvState *d, struct pscnv_memory_area *area) {
+void pscnv_free_memory(PscnvState *d, struct pscnv_memory_area *area) {
     area->handle = -1;
     if (area->prev != NULL && area->prev->handle == (uint32_t)-1) {
         area = area->prev;
@@ -102,9 +102,11 @@ static void pscnv_execute_mem_alloc(PscnvState *d,
         cmd->command = PSCNV_RESULT_ERROR;
         return;
     }
+    result.cookie = cmd->cookie;
+    result.flags = cmd->flags;
+    result.tile_flags = cmd->tile_flags;
     result.size = (cmd->size + 0xfff) & ~0xfff;
     result.mapping = NULL;
-    result.cid = (uint32_t)-1;
     cmd->handle = add_allocation_entry(d, &result);
 #ifdef DUMP_HYPERCALLS
     fprintf(stderr, "pscnv_gem_new: allocated %"PRIx64" bytes, handle %d\n",
@@ -219,7 +221,7 @@ static void pscnv_execute_mem_free(PscnvState *d,
             fprintf(stderr, "pscnv_virt: could not unmap %d\n", cmd->handle);
         }
         /* mark the memory area as free */
-        free_memory(d, obj->mapping);
+        pscnv_free_memory(d, obj->mapping);
     }
     /* free the allocation list entry */
     obj->next = d->alloc_freelist;
@@ -913,12 +915,12 @@ static int pci_pscnv_init(PCIDevice *pci_dev)
     }
 
     /* allocate contiguous virtual address space for the vram bar */
-    d->vram_bar_memory = mmap(NULL, PSCNV_VIRT_VRAM_SIZE, PROT_NONE,
+    d->vram_bar_memory = mmap(NULL, PSCNV_VIRT_VRAM_SIZE, PROT_READ | PROT_WRITE,
                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (d->vram_bar_memory == MAP_FAILED) {
         hw_error("%s: could not allocate vram bar memory\n", __func__);
     }
-    d->chan_bar_memory = mmap(NULL, d->chan_bar_size, PROT_NONE,
+    d->chan_bar_memory = mmap(NULL, d->chan_bar_size, PROT_READ | PROT_WRITE,
                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (d->vram_bar_memory == MAP_FAILED) {
         hw_error("%s: could not allocate chan bar memory\n", __func__);
@@ -956,6 +958,7 @@ static int pci_pscnv_init(PCIDevice *pci_dev)
                                PSCNV_VIRT_VRAM_SIZE, d->vram_bar_memory);
 #endif
     pci_register_bar(pci_dev, 2, 0, &d->vram_bar);
+    vmstate_register_ram(&d->vram_bar, &pci_dev->qdev);
 
 #ifdef PSCNV_DEBUG_CHAN_ACCESS
     memory_region_init_io(&d->chan_bar, &pscnv_chan_debug_ops, d, "pscnv-chan",
@@ -965,6 +968,7 @@ static int pci_pscnv_init(PCIDevice *pci_dev)
                                d->chan_bar_memory);
 #endif
     pci_register_bar(pci_dev, 3, 0, &d->chan_bar);
+    vmstate_register_ram(&d->chan_bar, &pci_dev->qdev);
 
     /* mark the whole bar as free */
     struct pscnv_memory_area *memory_area = malloc(sizeof(*memory_area));
