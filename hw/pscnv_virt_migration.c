@@ -128,7 +128,7 @@ static void pscnv_resume_channels(PscnvState *d) {
             uint64_t map_handle;
             void *chmem;
             /* create a new channel */
-            ret = pscnv_chan_new(d->drm_fd, d->chan_vspace[i],
+            ret = pscnv_chan_new(d->drm_fd, d->vspace_handle[d->chan_vspace[i]],
                                  &d->chan_handle[i], &map_handle);
             if (ret) {
                 fprintf(stderr, "pscnv_virt: pscnv_chan_new failed (%d)\n", ret);
@@ -432,12 +432,49 @@ static int pscnv_save_live_iterate(QEMUFile *f, void *opaque) {
 }
 static int pscnv_save_live_complete(QEMUFile *f, void *opaque) {
     PscnvState *d = opaque;
+    int i;
+    char *current_channel = d->channel_content;
+    unsigned int chsize = d->is_nv50 ? 0x2000 : 0x1000;
 
     fprintf(stderr, "pscnv_save_live_complete\n");
 
     /* write remaining log entries */
     while (pscnv_save_log_entry(d, f) != 0);
-    /* TODO: write remaining information about channels and virtual address spaces */
+    /* write remaining information about channels and virtual address spaces */
+    for (i = 0; i < PSCNV_VIRT_VSPACE_COUNT; i++) {
+        if (d->vspace_handle[i] != (uint32_t)-1) {
+            struct pscnv_vspace_mapping *mapping = d->vspace_mapping[i];
+            qemu_put_byte(f, PSCNV_SAVE_VSPACE);
+            qemu_put_be32(f, i);
+            while(mapping != NULL) {
+                qemu_put_byte(f, PSCNV_SAVE_VSPACE_MAP);
+                qemu_put_be32(f, mapping->vspace);
+                qemu_put_be32(f, mapping->obj);
+                qemu_put_be64(f, mapping->offset);
+            }
+            mapping = mapping->vspace_next;
+        }
+    }
+    for (i = 0; i < PSCNV_VIRT_CHAN_COUNT; i++) {
+        if (d->chan_handle[i] != (uint32_t)-1) {
+            qemu_put_byte(f, PSCNV_SAVE_CHAN);
+            qemu_put_be32(f, i);
+            qemu_put_be32(f, d->chan_vspace[i]);
+            if (d->fifo_init[i].command != (uint32_t)-1) {
+                struct pscnv_fifo_init_ib_cmd *cmd = &d->fifo_init[i];
+                qemu_put_byte(f, 1);
+                qemu_put_be32(f, cmd->pb_handle);
+                qemu_put_be32(f, cmd->flags);
+                qemu_put_be32(f, cmd->slimask);
+                qemu_put_be64(f, cmd->ib_start);
+                qemu_put_be32(f, cmd->ib_order);
+            } else {
+                qemu_put_byte(f, 0);
+            }
+            qemu_put_buffer(f, (void*)current_channel, chsize);
+            current_channel += chsize;
+        }
+    }
 
     qemu_put_byte(f, PSCNV_SAVE_EOS);
 

@@ -85,6 +85,47 @@ static uint32_t add_allocation_entry(PscnvState *d,
     return result;
 }
 
+void pscnv_add_vspace_mapping(PscnvState *d, uint32_t vspace,
+                              uint32_t obj_handle, uint64_t offset) {
+    struct pscnv_memory_allocation *obj = &d->alloc_data[obj_handle];
+    struct pscnv_vspace_mapping *mapping = malloc(sizeof(*mapping));
+    mapping->obj = obj_handle;
+    mapping->vspace = vspace;
+    mapping->offset = offset;
+    mapping->obj_prev = NULL;
+    mapping->obj_next = obj->vspace_mapping;
+    if (obj->vspace_mapping != NULL) {
+        obj->vspace_mapping->obj_prev = mapping;
+    }
+    obj->vspace_mapping = mapping;
+    mapping->vspace_prev = NULL;
+    mapping->vspace_next = d->vspace_mapping[vspace];
+    if (d->vspace_mapping[vspace] != NULL) {
+        d->vspace_mapping[vspace]->vspace_prev = mapping;
+    }
+    d->vspace_mapping[vspace] = mapping;
+}
+void pscnv_remove_vspace_mapping(PscnvState *d,
+                                 struct pscnv_vspace_mapping *mapping) {
+    if (mapping->obj_prev != NULL) {
+        mapping->obj_prev->obj_next = mapping->obj_next;
+    } else {
+        d->alloc_data[mapping->obj].vspace_mapping = mapping->obj_next;
+    }
+    if (mapping->obj_next != NULL) {
+        mapping->obj_next->obj_prev = mapping->obj_prev;
+    }
+    if (mapping->vspace_prev != NULL) {
+        mapping->vspace_prev->vspace_next = mapping->vspace_next;
+    } else {
+        d->vspace_mapping[mapping->vspace] = mapping->vspace_next;
+    }
+    if (mapping->vspace_next != NULL) {
+        mapping->vspace_next->vspace_prev = mapping->vspace_prev;
+    }
+    free(mapping);
+}
+
 static void pscnv_execute_mem_alloc(PscnvState *d,
                                     volatile struct pscnv_alloc_mem_cmd *cmd) {
     int ret;
@@ -107,6 +148,7 @@ static void pscnv_execute_mem_alloc(PscnvState *d,
     result.tile_flags = cmd->tile_flags;
     result.size = (cmd->size + 0xfff) & ~0xfff;
     result.mapping = NULL;
+    result.vspace_mapping = NULL;
     cmd->handle = add_allocation_entry(d, &result);
 #ifdef DUMP_HYPERCALLS
     fprintf(stderr, "pscnv_gem_new: allocated %"PRIx64" bytes, handle %d\n",
@@ -249,6 +291,8 @@ static void pscnv_execute_vspace_alloc(PscnvState *d,
 {
     uint32_t vid;
     int ret;
+    int i;
+    uint32_t handle = (uint32_t)-1;
 
     ret = pscnv_vspace_new(d->drm_fd, &vid);
     if (ret) {
@@ -259,7 +303,18 @@ static void pscnv_execute_vspace_alloc(PscnvState *d,
 #ifdef DUMP_HYPERCALLS
     fprintf(stderr, "pscnv_vspace_new: allocated %d\n", vid);
 #endif
-    cmd->vid = vid;
+    for (i = 0; i < PSCNV_VIRT_VSPACE_COUNT; i++) {
+        if (d->vspace_handle[i] == (uint32_t)-1) {
+            d->vspace_handle[i] = vid;
+            d->vspace_mapping[i] = NULL;
+            handle = i;
+            break;
+        }
+    }
+    if (handle == (uint32_t)-1) {
+        fprintf(stderr, "pscnv_vspace_new: Too many vspaces!\n");
+    }
+    cmd->vid = handle;
     cmd->command = PSCNV_RESULT_NO_ERROR;
 }
 
@@ -267,11 +322,23 @@ static void pscnv_execute_vspace_free(PscnvState *d,
                                       volatile struct pscnv_vspace_cmd *cmd)
 {
     int ret;
+    uint32_t vid;
 
+    if (cmd->vid >= PSCNV_VIRT_VSPACE_COUNT
+            || d->vspace_handle[cmd->vid] == (uint32_t)-1) {
+        fprintf(stderr, "pscnv_virt: pscnv_execute_vspace_free invalid vid %d\n", cmd->vid);
+        cmd->command = PSCNV_RESULT_ERROR;
+        return;
+    }
+    vid = d->vspace_handle[cmd->vid];
 #ifdef DUMP_HYPERCALLS
     fprintf(stderr, "pscnv_vspace_free: freeing %d\n", cmd->vid);
 #endif
-    ret = pscnv_vspace_free(d->drm_fd, cmd->vid);
+    while (d->vspace_mapping[cmd->vid] != NULL) {
+        pscnv_remove_vspace_mapping(d, d->vspace_mapping[cmd->vid]);
+    }
+    d->vspace_handle[cmd->vid] = (uint32_t)-1;
+    ret = pscnv_vspace_free(d->drm_fd, vid);
     if (ret) {
         fprintf(stderr, "pscnv_virt: pscnv_vspace_free failed (%d)\n", ret);
         cmd->command = PSCNV_RESULT_ERROR;
@@ -285,6 +352,7 @@ static void pscnv_execute_vspace_map(PscnvState *d,
 {
     int ret;
     uint64_t offset;
+    uint32_t vid;
 
 #ifdef DUMP_HYPERCALLS
     fprintf(stderr, "pscnv_vspace_map: %d %d 0x%"PRIx64" 0x%"PRIx64" 0x%x 0x%x\n",
@@ -297,8 +365,15 @@ static void pscnv_execute_vspace_map(PscnvState *d,
         cmd->command = PSCNV_RESULT_ERROR;
         return;
     }
+    if (cmd->vid >= PSCNV_VIRT_VSPACE_COUNT
+            || d->vspace_handle[cmd->vid] == (uint32_t)-1) {
+        fprintf(stderr, "pscnv_virt: pscnv_execute_vspace_map invalid vid %d\n", cmd->vid);
+        cmd->command = PSCNV_RESULT_ERROR;
+        return;
+    }
+    vid = d->vspace_handle[cmd->vid];
 
-    ret = pscnv_vspace_map(d->drm_fd, cmd->vid,
+    ret = pscnv_vspace_map(d->drm_fd, vid,
                            d->alloc_data[cmd->handle].handle, cmd->start,
                            cmd->end, cmd->back, cmd->flags, &offset);
     if (ret != 0) {
@@ -306,6 +381,8 @@ static void pscnv_execute_vspace_map(PscnvState *d,
         cmd->command = PSCNV_RESULT_ERROR;
         return;
     }
+    // add mapping list entry
+    pscnv_add_vspace_mapping(d, cmd->vid, cmd->handle, offset);
 #ifdef DUMP_HYPERCALLS
     fprintf(stderr, "pscnv_vspace_map: result 0x%"PRIx64"\n",
             offset);
@@ -318,17 +395,37 @@ static void pscnv_execute_vspace_unmap(PscnvState *d,
                                        volatile struct pscnv_vspace_unmap_cmd *cmd)
 {
     int ret;
+    uint32_t vid;
+    struct pscnv_vspace_mapping *mapping;
 
 #ifdef DUMP_HYPERCALLS
     fprintf(stderr, "pscnv_vspace_unmap: %d 0x%"PRIx64"\n",
             cmd->vid, cmd->offset);
 #endif
-    ret = pscnv_vspace_unmap(d->drm_fd, cmd->vid, cmd->offset);
+    if (cmd->vid >= PSCNV_VIRT_VSPACE_COUNT
+            || d->vspace_handle[cmd->vid] == (uint32_t)-1) {
+        fprintf(stderr, "pscnv_virt: pscnv_execute_vspace_unmap invalid vid %d\n", cmd->vid);
+        cmd->command = PSCNV_RESULT_ERROR;
+        return;
+    }
+    vid = d->vspace_handle[cmd->vid];
+
+    ret = pscnv_vspace_unmap(d->drm_fd, vid, cmd->offset);
     if (ret != 0) {
         fprintf(stderr, "pscnv_vspace_unmap failed (%d)\n", ret);
         cmd->command = PSCNV_RESULT_ERROR;
         return;
     }
+
+    // remove mapping list entry
+    mapping = d->vspace_mapping[cmd->vid];
+    while (mapping != NULL) {
+        if (mapping->offset == cmd->offset) {
+            pscnv_remove_vspace_mapping(d, mapping);
+            break;
+        }
+    }
+
     cmd->command = PSCNV_RESULT_NO_ERROR;
 }
 
@@ -341,12 +438,21 @@ static void pscnv_execute_chan_new(PscnvState *d,
     int ret;
     unsigned int chsize;
     void *chmem;
+    uint32_t vid;
 
 #ifdef DUMP_HYPERCALLS
     fprintf(stderr, "pscnv_chan_new: %d\n", cmd->vid);
 #endif
+    if (cmd->vid >= PSCNV_VIRT_VSPACE_COUNT
+            || d->vspace_handle[cmd->vid] == (uint32_t)-1) {
+        fprintf(stderr, "pscnv_virt: pscnv_execute_vspace_unmap invalid vid %d\n", cmd->vid);
+        cmd->command = PSCNV_RESULT_ERROR;
+        return;
+    }
+    vid = d->vspace_handle[cmd->vid];
+
     if (d->migration_active == 0) {
-        ret = pscnv_chan_new(d->drm_fd, cmd->vid, &cid, &map_handle);
+        ret = pscnv_chan_new(d->drm_fd, vid, &cid, &map_handle);
         if (ret) {
             fprintf(stderr, "pscnv_virt: pscnv_chan_new failed (%d)\n", ret);
             cmd->command = PSCNV_RESULT_ERROR;
@@ -983,6 +1089,8 @@ static int pci_pscnv_init(PCIDevice *pci_dev)
     /* no channels have been allocated yet */
     memset(d->chan_handle, -1, sizeof(d->chan_handle));
     memset(d->fifo_init, -1, sizeof(d->fifo_init));
+
+    memset(d->vspace_handle, -1, sizeof(d->vspace_handle));
 
     /* install the handlers needed for migration */
     register_savevm_live(&pci_dev->qdev, "pscnv_virt", -1, 1,
