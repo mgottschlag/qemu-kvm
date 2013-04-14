@@ -314,7 +314,7 @@ static void pscnv_execute_vspace_alloc(PscnvState *d,
     if (handle == (uint32_t)-1) {
         fprintf(stderr, "pscnv_vspace_new: Too many vspaces!\n");
     }
-    cmd->vid = handle;
+    cmd->vid = handle + 1;
     cmd->command = PSCNV_RESULT_NO_ERROR;
 }
 
@@ -324,20 +324,20 @@ static void pscnv_execute_vspace_free(PscnvState *d,
     int ret;
     uint32_t vid;
 
-    if (cmd->vid >= PSCNV_VIRT_VSPACE_COUNT
-            || d->vspace_handle[cmd->vid] == (uint32_t)-1) {
+    if (cmd->vid <= 0 || cmd->vid - 1 >= PSCNV_VIRT_VSPACE_COUNT
+            || d->vspace_handle[cmd->vid - 1] == (uint32_t)-1) {
         fprintf(stderr, "pscnv_virt: pscnv_execute_vspace_free invalid vid %d\n", cmd->vid);
         cmd->command = PSCNV_RESULT_ERROR;
         return;
     }
-    vid = d->vspace_handle[cmd->vid];
+    vid = d->vspace_handle[cmd->vid - 1];
 #ifdef DUMP_HYPERCALLS
     fprintf(stderr, "pscnv_vspace_free: freeing %d\n", cmd->vid);
 #endif
-    while (d->vspace_mapping[cmd->vid] != NULL) {
-        pscnv_remove_vspace_mapping(d, d->vspace_mapping[cmd->vid]);
+    while (d->vspace_mapping[cmd->vid - 1] != NULL) {
+        pscnv_remove_vspace_mapping(d, d->vspace_mapping[cmd->vid - 1]);
     }
-    d->vspace_handle[cmd->vid] = (uint32_t)-1;
+    d->vspace_handle[cmd->vid - 1] = (uint32_t)-1;
     ret = pscnv_vspace_free(d->drm_fd, vid);
     if (ret) {
         fprintf(stderr, "pscnv_virt: pscnv_vspace_free failed (%d)\n", ret);
@@ -365,13 +365,13 @@ static void pscnv_execute_vspace_map(PscnvState *d,
         cmd->command = PSCNV_RESULT_ERROR;
         return;
     }
-    if (cmd->vid >= PSCNV_VIRT_VSPACE_COUNT
-            || d->vspace_handle[cmd->vid] == (uint32_t)-1) {
+    if (cmd->vid <= 0 || cmd->vid >= PSCNV_VIRT_VSPACE_COUNT
+            || d->vspace_handle[cmd->vid - 1] == (uint32_t)-1) {
         fprintf(stderr, "pscnv_virt: pscnv_execute_vspace_map invalid vid %d\n", cmd->vid);
         cmd->command = PSCNV_RESULT_ERROR;
         return;
     }
-    vid = d->vspace_handle[cmd->vid];
+    vid = d->vspace_handle[cmd->vid - 1];
 
     ret = pscnv_vspace_map(d->drm_fd, vid,
                            d->alloc_data[cmd->handle].handle, cmd->start,
@@ -382,7 +382,7 @@ static void pscnv_execute_vspace_map(PscnvState *d,
         return;
     }
     // add mapping list entry
-    pscnv_add_vspace_mapping(d, cmd->vid, cmd->handle, offset);
+    pscnv_add_vspace_mapping(d, cmd->vid - 1, cmd->handle, offset);
 #ifdef DUMP_HYPERCALLS
     fprintf(stderr, "pscnv_vspace_map: result 0x%"PRIx64"\n",
             offset);
@@ -402,13 +402,13 @@ static void pscnv_execute_vspace_unmap(PscnvState *d,
     fprintf(stderr, "pscnv_vspace_unmap: %d 0x%"PRIx64"\n",
             cmd->vid, cmd->offset);
 #endif
-    if (cmd->vid >= PSCNV_VIRT_VSPACE_COUNT
-            || d->vspace_handle[cmd->vid] == (uint32_t)-1) {
+    if (cmd->vid <= 0 || cmd->vid - 1 >= PSCNV_VIRT_VSPACE_COUNT
+            || d->vspace_handle[cmd->vid - 1] == (uint32_t)-1) {
         fprintf(stderr, "pscnv_virt: pscnv_execute_vspace_unmap invalid vid %d\n", cmd->vid);
         cmd->command = PSCNV_RESULT_ERROR;
         return;
     }
-    vid = d->vspace_handle[cmd->vid];
+    vid = d->vspace_handle[cmd->vid - 1];
 
     ret = pscnv_vspace_unmap(d->drm_fd, vid, cmd->offset);
     if (ret != 0) {
@@ -418,12 +418,13 @@ static void pscnv_execute_vspace_unmap(PscnvState *d,
     }
 
     // remove mapping list entry
-    mapping = d->vspace_mapping[cmd->vid];
+    mapping = d->vspace_mapping[cmd->vid - 1];
     while (mapping != NULL) {
         if (mapping->offset == cmd->offset) {
             pscnv_remove_vspace_mapping(d, mapping);
             break;
         }
+        mapping = mapping->vspace_next;
     }
 
     cmd->command = PSCNV_RESULT_NO_ERROR;
@@ -443,13 +444,13 @@ static void pscnv_execute_chan_new(PscnvState *d,
 #ifdef DUMP_HYPERCALLS
     fprintf(stderr, "pscnv_chan_new: %d\n", cmd->vid);
 #endif
-    if (cmd->vid >= PSCNV_VIRT_VSPACE_COUNT
-            || d->vspace_handle[cmd->vid] == (uint32_t)-1) {
+    if (cmd->vid <= 0 || cmd->vid - 1 >= PSCNV_VIRT_VSPACE_COUNT
+            || d->vspace_handle[cmd->vid - 1] == (uint32_t)-1) {
         fprintf(stderr, "pscnv_virt: pscnv_execute_vspace_unmap invalid vid %d\n", cmd->vid);
         cmd->command = PSCNV_RESULT_ERROR;
         return;
     }
-    vid = d->vspace_handle[cmd->vid];
+    vid = d->vspace_handle[cmd->vid - 1];
 
     if (d->migration_active == 0) {
         ret = pscnv_chan_new(d->drm_fd, vid, &cid, &map_handle);
@@ -482,7 +483,7 @@ static void pscnv_execute_chan_new(PscnvState *d,
         memset(d->chan_bar_memory + chan_index * chsize, 0, chsize);
     }
     d->chan_handle[chan_index] = cid;
-    d->chan_vspace[chan_index] = cmd->vid;
+    d->chan_vspace[chan_index] = cmd->vid - 1;
     d->fifo_init[chan_index].command = -1;
 
 #ifdef DUMP_HYPERCALLS

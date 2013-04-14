@@ -451,8 +451,8 @@ static int pscnv_save_live_complete(QEMUFile *f, void *opaque) {
                 qemu_put_be32(f, mapping->vspace);
                 qemu_put_be32(f, mapping->obj);
                 qemu_put_be64(f, mapping->offset);
+                mapping = mapping->vspace_next;
             }
-            mapping = mapping->vspace_next;
         }
     }
     for (i = 0; i < PSCNV_VIRT_CHAN_COUNT; i++) {
