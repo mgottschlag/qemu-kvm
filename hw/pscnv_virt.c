@@ -86,12 +86,14 @@ static uint32_t add_allocation_entry(PscnvState *d,
 }
 
 void pscnv_add_vspace_mapping(PscnvState *d, uint32_t vspace,
-                              uint32_t obj_handle, uint64_t offset) {
+                              uint32_t obj_handle, uint64_t offset,
+                              uint32_t flags) {
     struct pscnv_memory_allocation *obj = &d->alloc_data[obj_handle];
     struct pscnv_vspace_mapping *mapping = malloc(sizeof(*mapping));
     mapping->obj = obj_handle;
     mapping->vspace = vspace;
     mapping->offset = offset;
+    mapping->flags = flags;
     mapping->obj_prev = NULL;
     mapping->obj_next = obj->vspace_mapping;
     if (obj->vspace_mapping != NULL) {
@@ -211,17 +213,18 @@ static void pscnv_execute_map(PscnvState *d,
             return;
         }
     } else {
-        obj->migration_mapping = mmap(NULL, obj->size,
+        void *data = mmap(NULL, obj->size,
                 PROT_READ | PROT_WRITE, MAP_SHARED, d->drm_fd,
                 obj->map_handle);
-        if (obj->migration_mapping == MAP_FAILED) {
+        if (data == MAP_FAILED) {
             fprintf(stderr, "pscnv_virt: could not map obj: %d\n",
                     cmd->handle);
             cmd->command = PSCNV_RESULT_ERROR;
             return;
         }
         memcpy(d->vram_bar_memory + obj->mapping->start,
-               obj->migration_mapping, obj->size);
+               data, obj->size);
+        munmap(data, obj->size);
     }
 #ifdef DUMP_HYPERCALLS
         fprintf(stderr, "pscnv_virt: mapped %d to %x\n",
@@ -382,7 +385,7 @@ static void pscnv_execute_vspace_map(PscnvState *d,
         return;
     }
     // add mapping list entry
-    pscnv_add_vspace_mapping(d, cmd->vid - 1, cmd->handle, offset);
+    pscnv_add_vspace_mapping(d, cmd->vid - 1, cmd->handle, offset, cmd->flags);
 #ifdef DUMP_HYPERCALLS
     fprintf(stderr, "pscnv_vspace_map: result 0x%"PRIx64"\n",
             offset);

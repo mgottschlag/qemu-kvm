@@ -1,6 +1,8 @@
 
 #include "pscnv_virt.h"
 
+#include "sysemu.h"
+
 #include <libpscnv.h>
 #include <sys/mman.h>
 
@@ -121,7 +123,8 @@ static void pscnv_resume_channels(PscnvState *d) {
      * Reallocate all channels.
      */
     chsize = d->is_nv50 ? 0x2000 : 0x1000;
-    current_channel = d->channel_content;
+    /*current_channel = d->channel_content;*/
+    current_channel = malloc(chsize);
     for (i = 0; i < PSCNV_VIRT_CHAN_COUNT; i++) {
         if (chan_is_allocated(d, i)) {
             fprintf(stderr, "pscnv_save_cancel: Allocating channel %d.\n", i);
@@ -138,6 +141,8 @@ static void pscnv_resume_channels(PscnvState *d) {
                         d->chan_handle[i]);
                 return;
             }
+            /* backup the old channel content */
+            memcpy(current_channel, d->chan_bar_memory + i * chsize, chsize);
             /* map the channel */
             chmem = mmap(d->chan_bar_memory + i * chsize, chsize,
                          PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
@@ -151,15 +156,15 @@ static void pscnv_resume_channels(PscnvState *d) {
             if (d->fifo_init[i].command != (uint32_t)-1) {
                 struct pscnv_fifo_init_ib_cmd *cmd = &d->fifo_init[i];
                 ret = pscnv_fifo_init_ib(d->drm_fd, d->chan_handle[i], cmd->pb_handle,
-                                         cmd->flags, cmd->slimask, cmd->ib_start,
-                                         cmd->ib_order);
+                                           cmd->flags, cmd->slimask, cmd->ib_start,
+                                           cmd->ib_order);
                 if (ret) {
                     fprintf(stderr, "pscnv_virt: pscnv_fifo_init_ib failed (%d)\n", ret);
                 }
             }
-            current_channel += chsize;
         }
     }
+    free(current_channel);
 }
 
 static void pscnv_revert_migration_mappings(PscnvState *d) {
@@ -169,36 +174,32 @@ static void pscnv_revert_migration_mappings(PscnvState *d) {
     // Copy changed memory content from RAM to GPU
     for (i = 0; i < d->alloc_count; i++) {
         struct pscnv_memory_allocation *obj = &d->alloc_data[i];
-        if (obj->size != (uint64_t)-1) {
-            if (obj->migration_mapping != NULL && obj->mapping != NULL) {
-                memcpy(d->vram_bar_memory + obj->mapping->start,
-                       obj->migration_mapping, obj->size);
+        if (obj->size != (uint64_t)-1 && obj->mapping != NULL) {
+            void *data = mmap(NULL, obj->size, PROT_READ | PROT_WRITE,
+                              MAP_SHARED, d->drm_fd, obj->map_handle);
+            if (data == MAP_FAILED) {
+                fprintf(stderr, "pscnv_virt: could not map obj %d\n", i);
+                continue;
             }
+            memcpy(data, d->vram_bar_memory + obj->mapping->start, obj->size);
+            munmap(data, obj->size);
         }
     }
     // Unmap copies made for migration
-    mmap_result = mmap(d->vram_bar_memory, PSCNV_VIRT_VRAM_SIZE, PROT_NONE,
+    /*mmap_result = mmap(d->vram_bar_memory, PSCNV_VIRT_VRAM_SIZE, PROT_NONE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     if (mmap_result == MAP_FAILED) {
         fprintf(stderr, "pscnv_virt: could not unmap vram\n");
-    }
+    }*/
     // Map objects into the VRAM BAR again
     for (i = 0; i < d->alloc_count; i++) {
         struct pscnv_memory_allocation *obj = &d->alloc_data[i];
-        if (obj->size != (uint64_t)-1) {
-            if (obj->migration_mapping != NULL) {
-                if (munmap(obj->migration_mapping, obj->size) != 0) {
-                    fprintf(stderr, "pscnv_virt: could not unmap obj %d\n", i);
-                }
-            }
-            obj->migration_mapping = NULL;
-            if (obj->mapping != NULL) {
-                mmap_result = mmap(d->vram_bar_memory + obj->mapping->start, obj->size,
-                        PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, d->drm_fd,
-                        obj->map_handle);
-                if (mmap_result == MAP_FAILED) {
-                    fprintf(stderr, "pscnv_virt: could not map obj %d\n", i);
-                }
+        if (obj->size != (uint64_t)-1 && obj->mapping != NULL) {
+            mmap_result = mmap(d->vram_bar_memory + obj->mapping->start, obj->size,
+                    PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, d->drm_fd,
+                    obj->map_handle);
+            if (mmap_result == MAP_FAILED) {
+                fprintf(stderr, "pscnv_virt: could not map obj %d\n", i);
             }
         }
     }
@@ -285,9 +286,13 @@ static int pscnv_save_live_setup(QEMUFile *f, void *opaque) {
     unsigned int chsize;
     PscnvState *d = opaque;
     unsigned int channel_count;
-    char *current_channel;
+    /*char *current_channel;*/
     void *mmap_result;
     int ret;
+    char *channel_content;
+
+    int saved_vm_running = runstate_is_running();
+    vm_stop(RUN_STATE_SAVE_VM);
 
     fprintf(stderr, "pscnv_save_live_setup\n");
 
@@ -314,12 +319,16 @@ static int pscnv_save_live_setup(QEMUFile *f, void *opaque) {
     /**
      * Save the channel content and unmap the channels.
      */
-    d->channel_content = malloc(chsize * channel_count);
-    current_channel = d->channel_content;
+    channel_content = mmap(NULL, d->chan_bar_size,
+                       PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    /*d->channel_content = malloc(chsize * channel_count);*/
+    /*current_channel = d->channel_content;*/
     for (i = 0; i < PSCNV_VIRT_CHAN_COUNT; i++) {
         if (chan_is_allocated(d, i)) {
-            fprintf(stderr, "pscnv_save_cancel: Deleting channel %d.\n", i);
-            memcpy(current_channel, d->chan_bar_memory + i * chsize, chsize);
+            fprintf(stderr, "pscnv_save_live_setup: Deleting channel %d.\n", i);
+            memcpy(channel_content + i * chsize,
+                   d->chan_bar_memory + i * chsize, chsize);
             /* delete the channel */
             ret = pscnv_chan_free(d->drm_fd, d->chan_handle[i]);
             if (ret) {
@@ -331,16 +340,26 @@ static int pscnv_save_live_setup(QEMUFile *f, void *opaque) {
             if (mmap_result == MAP_FAILED) {
                 fprintf(stderr, "pscnv_virt: could not unmap channel %d\n", i);
             }
-            current_channel += chsize;
+            /*current_channel += chsize;*/
         }
     }
+    /*munmap(d->chan_bar_memory, d->chan_bar_size);
+    channel_content = mremap(channel_content, d->chan_bar_size,
+                             d->chan_bar_size, MREMAP_FIXED,
+                             d->chan_bar_memory);*/
     mmap_result = mmap(d->chan_bar_memory, d->chan_bar_size,
                        PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     if (mmap_result == MAP_FAILED) {
         fprintf(stderr, "pscnv_virt: could not unmap channels\n");
+        if (saved_vm_running) {
+            vm_start();
+        }
         return -1;
     }
+    // TODO: this can be optimized?
+    memcpy(d->chan_bar_memory, channel_content, d->chan_bar_size);
+    munmap(channel_content, d->chan_bar_size);
 
     /**
      * Map GPU memory contents.
@@ -367,22 +386,26 @@ static int pscnv_save_live_setup(QEMUFile *f, void *opaque) {
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     if (mmap_result == MAP_FAILED) {
         fprintf(stderr, "pscnv_virt: could not unmap vram\n");
+        if (saved_vm_running) {
+            vm_start();
+        }
         return -1;
     }
     for (i = 0; i < d->alloc_count; i++) {
         struct pscnv_memory_allocation *obj = &d->alloc_data[i];
-        if (obj->size != (uint64_t)-1) {
-            obj->migration_mapping =
-                    mmap(NULL, obj->size, PROT_READ | PROT_WRITE,
-                         MAP_SHARED, d->drm_fd, obj->map_handle);
-            if (obj->migration_mapping == MAP_FAILED) {
+        if (obj->size != (uint64_t)-1 && obj->mapping != NULL) {
+            void *data = mmap(NULL, obj->size, PROT_READ | PROT_WRITE,
+                              MAP_SHARED, d->drm_fd, obj->map_handle);
+            if (data == MAP_FAILED) {
                 fprintf(stderr, "pscnv_virt: could not map obj %d\n", i);
+                if (saved_vm_running) {
+                    vm_start();
+                }
                 return -1;
             }
-            if (obj->mapping != NULL) {
-                memcpy(d->vram_bar_memory + obj->mapping->start,
-                       obj->migration_mapping, obj->size);
-            }
+            memcpy(d->vram_bar_memory + obj->mapping->start,
+                   data, obj->size);
+            munmap(data, obj->size);
         }
     }
 
@@ -406,6 +429,9 @@ static int pscnv_save_live_setup(QEMUFile *f, void *opaque) {
 
     qemu_put_byte(f, PSCNV_SAVE_EOS);
 
+    if (saved_vm_running) {
+        vm_start();
+    }
     return 0;
 }
 
@@ -433,8 +459,8 @@ static int pscnv_save_live_iterate(QEMUFile *f, void *opaque) {
 static int pscnv_save_live_complete(QEMUFile *f, void *opaque) {
     PscnvState *d = opaque;
     int i;
-    char *current_channel = d->channel_content;
-    unsigned int chsize = d->is_nv50 ? 0x2000 : 0x1000;
+    /*char *current_channel = d->channel_content;
+    unsigned int chsize = d->is_nv50 ? 0x2000 : 0x1000;*/
 
     fprintf(stderr, "pscnv_save_live_complete\n");
 
@@ -447,10 +473,14 @@ static int pscnv_save_live_complete(QEMUFile *f, void *opaque) {
             qemu_put_byte(f, PSCNV_SAVE_VSPACE);
             qemu_put_be32(f, i);
             while(mapping != NULL) {
+                fprintf(stderr, "Saving mapping: %"PRIx64" - %"PRIx64"\n",
+                        mapping->offset,
+                        mapping->offset + d->alloc_data[mapping->obj].size);
                 qemu_put_byte(f, PSCNV_SAVE_VSPACE_MAP);
                 qemu_put_be32(f, mapping->vspace);
                 qemu_put_be32(f, mapping->obj);
                 qemu_put_be64(f, mapping->offset);
+                qemu_put_be32(f, mapping->flags);
                 mapping = mapping->vspace_next;
             }
         }
@@ -471,8 +501,8 @@ static int pscnv_save_live_complete(QEMUFile *f, void *opaque) {
             } else {
                 qemu_put_byte(f, 0);
             }
-            qemu_put_buffer(f, (void*)current_channel, chsize);
-            current_channel += chsize;
+            /*qemu_put_buffer(f, (void*)current_channel, chsize);
+            current_channel += chsize;*/
         }
     }
 
@@ -532,6 +562,7 @@ static int pscnv_load_state(QEMUFile *f, void *opaque, int version_id) {
             result.tile_flags = tile_flags;
             result.size = (size + 0xfff) & ~0xfff;
             result.mapping = NULL;
+            result.vspace_mapping = NULL;
             /* add it at the specified position */
             if (add_allocation_entry_fixed(d, handle, &result) != 0) {
                 fprintf(stderr, "Could not create allocation entry!\n");
@@ -577,17 +608,66 @@ static int pscnv_load_state(QEMUFile *f, void *opaque, int version_id) {
         } else if (type == PSCNV_SAVE_UNMAP) {
             // TODO
         } else if (type == PSCNV_SAVE_VSPACE) {
-            // TODO
+            uint32_t handle = qemu_get_be32(f);
+            uint32_t vid;
+            int ret;
+            ret = pscnv_vspace_new(d->drm_fd, &vid);
+            if (ret) {
+                fprintf(stderr, "pscnv_virt: pscnv_vspace_new failed (%d)\n", ret);
+                return -EINVAL;
+            }
+            fprintf(stderr, "Created vspace %d (%d).\n", handle, vid);
+            d->vspace_handle[handle] = vid;
+            d->vspace_mapping[handle] = NULL;
         } else if (type == PSCNV_SAVE_VSPACE_MAP) {
-            // TODO
+            uint32_t vspace = qemu_get_be32(f);
+            uint32_t obj = qemu_get_be32(f);
+            uint64_t offset = qemu_get_be64(f);
+            uint32_t flags = qemu_get_be32(f);
+            uint64_t result;
+            uint32_t vid = d->vspace_handle[vspace];
+
+            fprintf(stderr, "Mapping: %"PRIx64" - %"PRIx64"\n", offset,
+                    offset + d->alloc_data[obj].size);
+            ret = pscnv_vspace_map(d->drm_fd, vid,
+                                   d->alloc_data[obj].handle, offset,
+                                   offset + d->alloc_data[obj].size, 0, flags,
+                                   &result);
+            if (ret != 0) {
+                fprintf(stderr, "pscnv_vspace_map failed (%d)\n", ret);
+                return -EINVAL;
+            }
+            if (result != offset) {
+                fprintf(stderr, "pscnv_vspace_map: different resulting offset!\n");
+                return -EINVAL;
+            }
+            // add mapping list entry
+            pscnv_add_vspace_mapping(d, vspace, obj, offset, flags);
         } else if (type == PSCNV_SAVE_CHAN) {
-            // TODO
+            int initialized;
+            /*int chsize = d->is_nv50 ? 0x2000 : 0x1000;*/
+            uint32_t handle = qemu_get_be32(f);
+            uint32_t vspace = qemu_get_be32(f);
+            d->chan_handle[handle] = 0;
+            d->chan_vspace[handle] = vspace;
+            d->fifo_init[handle].command = -1;
+            initialized = qemu_get_byte(f) != 0;
+            if (initialized) {
+                struct pscnv_fifo_init_ib_cmd *cmd = &d->fifo_init[handle];
+                cmd->command = PSCNV_CMD_FIFO_INIT_IB;
+                cmd->pb_handle = qemu_get_be32(f);
+                cmd->flags = qemu_get_be32(f);
+                cmd->slimask = qemu_get_be32(f);
+                cmd->ib_start = qemu_get_be64(f);
+                cmd->ib_order = qemu_get_be32(f);
+            }
+            /*qemu_get_buffer(f, (void*)d->chan_bar_memory + handle * chsize, chsize);*/
         } else if (type == PSCNV_SAVE_FINISH) {
             fprintf(stderr, "pscnv_virt: Done!\n");
-            // TODO
+            pscnv_revert_migration_mappings(d);
+            pscnv_resume_channels(d);
         }
     }
-    // TODO
     return 0;
 }
 

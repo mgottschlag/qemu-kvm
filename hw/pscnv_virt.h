@@ -63,6 +63,7 @@ struct pscnv_vspace_mapping {
     uint32_t obj;
     uint32_t vspace;
     uint64_t offset;
+    uint32_t flags;
     struct pscnv_vspace_mapping *obj_prev;
     struct pscnv_vspace_mapping *obj_next;
     struct pscnv_vspace_mapping *vspace_prev;
@@ -86,7 +87,7 @@ struct pscnv_memory_allocation {
     uint32_t flags;
     uint32_t tile_flags;
     struct pscnv_memory_area *mapping;
-    void *migration_mapping;
+    /*void *migration_mapping;*/
     struct pscnv_vspace_mapping *vspace_mapping;
 };
 
@@ -212,7 +213,7 @@ typedef struct {
     uint32_t chan_handle[PSCNV_VIRT_CHAN_COUNT];
     uint32_t chan_vspace[PSCNV_VIRT_CHAN_COUNT];
     struct pscnv_fifo_init_ib_cmd fifo_init[PSCNV_VIRT_CHAN_COUNT];
-    void *channel_content;
+    /*void *channel_content;*/
 
     uint32_t vspace_handle[PSCNV_VIRT_VSPACE_COUNT];
     struct pscnv_vspace_mapping *vspace_mapping[PSCNV_VIRT_VSPACE_COUNT];
@@ -244,7 +245,8 @@ void pscnv_add_migration_log_entry(PscnvState *d, uint32_t handle,
 void pscnv_free_memory(PscnvState *d, struct pscnv_memory_area *area);
 
 void pscnv_add_vspace_mapping(PscnvState *d, uint32_t vspace,
-                              uint32_t obj_handle, uint64_t offset);
+                              uint32_t obj_handle, uint64_t offset,
+                              uint32_t flags);
 void pscnv_remove_vspace_mapping(PscnvState *d,
                                  struct pscnv_vspace_mapping *mapping);
 
