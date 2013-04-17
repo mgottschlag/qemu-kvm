@@ -113,6 +113,112 @@ static int chan_is_allocated(PscnvState *d, uint32_t chan) {
     return d->chan_handle[chan] != (uint32_t)-1;
 }
 
+static void init_channel(uint32_t *chan, uint32_t *ib, uint32_t *cmd,
+                         uint64_t cmd_offset) {
+    /* we only bind the COMPUTE and M2MF engines, the benchmarks do not need
+     * anything else to resume from the saved state */
+    /* TODO: implement the remaining state */
+    uint64_t ib_entry;
+    cmd[0] = (0x2<<28) | (1<<16) | (2<<13) | (0>>2);
+    cmd[1] = 0x9039;
+    cmd[2] = (0x2<<28) | (1<<16) | (1<<13) | (0>>2);
+    cmd[3] = 0x90c0;
+    ib_entry = cmd_offset | (16ull << 40);
+    ib[0] = ib_entry;
+    ib[1] = ib_entry >> 32;
+    chan[0x8c / 4] = 1;
+    while (chan[0x88 / 4] != 1);
+}
+
+static void restore_channel_state(PscnvState *d,
+                                  uint32_t handle,
+                                  uint32_t *data) {
+    struct pscnv_fifo_init_ib_cmd *init_cmd = &d->fifo_init[handle];
+    struct pscnv_vspace_mapping *mapping = d->vspace_mapping[d->chan_vspace[handle]];
+    uint32_t ib_handle = -1;
+    uint32_t *ib;
+    uint32_t cmd_handle;
+    uint64_t cmd_map_handle;
+    uint32_t *cmd;
+    uint64_t cmd_offset;
+    int ret;
+    /*uint32_t ib_get = data[0x88 / 4];*/
+    uint32_t ib_get = 0x1;
+    uint32_t ib_put = data[0x8c / 4];
+    uint64_t ib_entry;
+    uint32_t chsize = d->is_nv50 ? 0x2000 : 0x1000;
+    uint32_t *chan = (uint32_t*)(d->chan_bar_memory + handle * chsize);
+    int i;
+    fprintf(stderr, "Chan state: put: %d, get: %d\n", ib_put, ib_get);
+    /* find the IB */
+    while (mapping != NULL) {
+        if (init_cmd->ib_start == mapping->offset) {
+            ib_handle = mapping->obj;
+            break;
+        }
+        mapping = mapping->vspace_next;
+    }
+    if (ib_handle == (uint32_t)-1) {
+        fprintf(stderr, "restore_channel_state: IB not found!\n");
+        return;
+    }
+    ib = mmap(NULL, d->alloc_data[ib_handle].size, PROT_READ | PROT_WRITE,
+              MAP_SHARED, d->drm_fd, d->alloc_data[ib_handle].map_handle);
+    if (ib == MAP_FAILED) {
+        fprintf(stderr, "restore_channel_state: Could not map IB!\n");
+        return;
+    }
+
+    /* allocate some memory to place the command */
+    ret = pscnv_gem_new(d->drm_fd, 0x0, 0x6, 0x0,
+                        0x1000, NULL, &cmd_handle, &cmd_map_handle);
+    if (ret != 0) {
+        fprintf(stderr, "restore_channel_state: Could not create command buffer!\n");
+        return;
+    }
+    cmd = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE,
+              MAP_SHARED, d->drm_fd, cmd_map_handle);
+    if (cmd == MAP_FAILED) {
+        fprintf(stderr, "restore_channel_state: Could not map command buffer!\n");
+        return;
+    }
+    ret = pscnv_vspace_map(d->drm_fd, d->vspace_handle[d->chan_vspace[handle]],
+                           cmd_handle, 0x20000000, 0x10000000000ull,
+                           0x0, 0x0, &cmd_offset);
+    if (ret != 0) {
+        fprintf(stderr, "restore_channel_state: Could not map command buffer into vspace!\n");
+        return;
+    }
+    /* reinitialize the channel (add and initialize engines) */
+    init_channel(chan, ib, cmd, cmd_offset);
+    /* adjust the channel GET pointer by making the GPU execute NOP commands */
+    ib_entry = cmd_offset | (8ull << 40);
+    for (i = 1; i < ib_get; i++) {
+        cmd[0] = (0x2<<28) | (1<<16) | (1<<13) | (0x100>>2); /* 0x100 = NOP */
+        cmd[1] = 0;
+        ib[i * 2] = ib_entry;
+        ib[i * 2 + 1] = ib_entry >> 32;
+        chan[0x8c / 4] = i + 1;
+        while (1) {
+            uint32_t ib_get = chan[0x88 / 4];
+            uint32_t ib_put = chan[0x8c / 4];
+            fprintf(stderr, "put: %d, get: %d\n", ib_put, ib_get);
+            if (ib_get == ib_put) {
+                break;
+            }
+        }
+    }
+    /* update the PUT pointer to the value which has been set by the guest */
+    chan[0x8c / 4] = ib_put;
+    /* free the temporary command memory */
+    ret = pscnv_vspace_unmap(d->drm_fd,
+                             d->vspace_handle[d->chan_vspace[handle]],
+                             cmd_offset);
+    munmap(cmd, 0x1000);
+    pscnv_gem_close(d->drm_fd, cmd_handle);
+    munmap(ib, d->alloc_data[ib_handle].size);
+}
+
 static void pscnv_resume_channels(PscnvState *d) {
     int ret;
     int i;
@@ -151,8 +257,6 @@ static void pscnv_resume_channels(PscnvState *d) {
                 fprintf(stderr, "pscnv_virt: Could not map channel %d\n",
                         d->chan_handle[i]);
             }
-            /* restore the channel state */
-            memcpy(d->chan_bar_memory + i * chsize, current_channel, chsize);
             if (d->fifo_init[i].command != (uint32_t)-1) {
                 struct pscnv_fifo_init_ib_cmd *cmd = &d->fifo_init[i];
                 ret = pscnv_fifo_init_ib(d->drm_fd, d->chan_handle[i], cmd->pb_handle,
@@ -161,6 +265,9 @@ static void pscnv_resume_channels(PscnvState *d) {
                 if (ret) {
                     fprintf(stderr, "pscnv_virt: pscnv_fifo_init_ib failed (%d)\n", ret);
                 }
+                /* restore the channel state */
+                /*memcpy(d->chan_bar_memory + i * chsize, current_channel, chsize);*/
+                restore_channel_state(d, i, (uint32_t*)current_channel);
             }
         }
     }
@@ -230,8 +337,10 @@ static int pscnv_save_log_entry(PscnvState *d, QEMUFile *f) {
     d->migration_log_start = tmp->next;
     // TODO: this is not thread-safe!
     obj = d->alloc_data[entry.handle];
-    if (obj.mapping) {
+    if (obj.mapping != NULL) {
         mapping = *obj.mapping;
+    } else {
+        memset(&mapping, 0, sizeof(mapping));
     }
     /* for allocation entries we also need to map the buffer in case it is
      * deleted later */
@@ -316,6 +425,9 @@ static int pscnv_save_live_setup(QEMUFile *f, void *opaque) {
         }
     }
 
+	// HACK!
+	sleep(5);
+
     /**
      * Save the channel content and unmap the channels.
      */
@@ -381,7 +493,7 @@ static int pscnv_save_live_setup(QEMUFile *f, void *opaque) {
             }
         }
     }*/
-    mmap_result = mmap(d->vram_bar_memory, PSCNV_VIRT_VRAM_SIZE,
+    /*mmap_result = mmap(d->vram_bar_memory, PSCNV_VIRT_VRAM_SIZE,
                        PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     if (mmap_result == MAP_FAILED) {
@@ -407,7 +519,7 @@ static int pscnv_save_live_setup(QEMUFile *f, void *opaque) {
                    data, obj->size);
             munmap(data, obj->size);
         }
-    }
+    }*/
 
     /**
      * We just let the normal RAM migration code take care of mapped buffers.
@@ -459,8 +571,8 @@ static int pscnv_save_live_iterate(QEMUFile *f, void *opaque) {
 static int pscnv_save_live_complete(QEMUFile *f, void *opaque) {
     PscnvState *d = opaque;
     int i;
-    /*char *current_channel = d->channel_content;
-    unsigned int chsize = d->is_nv50 ? 0x2000 : 0x1000;*/
+    /*char *current_channel = d->channel_content;*/
+    unsigned int chsize = d->is_nv50 ? 0x2000 : 0x1000;
 
     fprintf(stderr, "pscnv_save_live_complete\n");
 
@@ -487,6 +599,10 @@ static int pscnv_save_live_complete(QEMUFile *f, void *opaque) {
     }
     for (i = 0; i < PSCNV_VIRT_CHAN_COUNT; i++) {
         if (d->chan_handle[i] != (uint32_t)-1) {
+            uint32_t *channel = (uint32_t*)(d->chan_bar_memory + i * chsize);
+            fprintf(stderr, "dma put: %08x get: %08x\n"
+                            "ib put: %08x get: %08x\n",
+                    channel[0x10], channel[0x11], channel[0x22], channel[0x23]);
             qemu_put_byte(f, PSCNV_SAVE_CHAN);
             qemu_put_be32(f, i);
             qemu_put_be32(f, d->chan_vspace[i]);
