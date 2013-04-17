@@ -16,6 +16,15 @@
 #define PSCNV_SAVE_CHAN 0x8
 #define PSCNV_SAVE_FINISH 0x9
 
+static uint64_t get_time(void) {
+    uint64_t usecs;
+    struct timespec time;
+    clock_gettime(CLOCK_REALTIME, &time);
+    usecs = time.tv_sec * 1000000;
+    usecs += time.tv_nsec / 1000;
+    return usecs;
+}
+
 
 static int add_allocation_entry_fixed(PscnvState *d, uint32_t handle,
                                       struct pscnv_memory_allocation *entry) {
@@ -362,7 +371,9 @@ static int pscnv_save_log_entry(PscnvState *d, QEMUFile *f) {
         fprintf(stderr, "ALLOC %x %x %x %x %"PRIx64"\n", entry.handle,
                 obj.cookie, obj.flags, obj.tile_flags, obj.size);
         if (obj.mapping == NULL) {
+            uint64_t start = get_time();
             qemu_put_buffer(f, buffer_data, obj.size);
+            fprintf(stderr, "transfer: %lfms\n", (double)(get_time() - start) / 1000);
         } else {
             qemu_put_be32(f, mapping.start);
             qemu_put_be32(f, mapping.size);
@@ -397,15 +408,18 @@ static int pscnv_save_live_setup(QEMUFile *f, void *opaque) {
     unsigned int channel_count;
     /*char *current_channel;*/
     void *mmap_result;
-    int ret;
     char *channel_content;
+    uint64_t start = get_time();
 
     int saved_vm_running = runstate_is_running();
+    fprintf(stderr, "freeze (%d).\n", saved_vm_running);
     vm_stop(RUN_STATE_SAVE_VM);
 
     fprintf(stderr, "pscnv_save_live_setup\n");
 
     d->migration_active = 1;
+
+    memcpy(d->chan_handle_tmp, d->chan_handle, sizeof(d->chan_handle));
 
     /**
      * Idle all channels.
@@ -425,9 +439,6 @@ static int pscnv_save_live_setup(QEMUFile *f, void *opaque) {
         }
     }
 
-	// HACK!
-	sleep(5);
-
     /**
      * Save the channel content and unmap the channels.
      */
@@ -438,14 +449,9 @@ static int pscnv_save_live_setup(QEMUFile *f, void *opaque) {
     /*current_channel = d->channel_content;*/
     for (i = 0; i < PSCNV_VIRT_CHAN_COUNT; i++) {
         if (chan_is_allocated(d, i)) {
-            fprintf(stderr, "pscnv_save_live_setup: Deleting channel %d.\n", i);
+            fprintf(stderr, "pscnv_save_live_setup: Unmapping channel %d.\n", i);
             memcpy(channel_content + i * chsize,
                    d->chan_bar_memory + i * chsize, chsize);
-            /* delete the channel */
-            ret = pscnv_chan_free(d->drm_fd, d->chan_handle[i]);
-            if (ret) {
-                fprintf(stderr, "pscnv_virt: could not free channel (%d)\n", ret);
-            }
             /* unmap the channel */
             mmap_result = mmap(d->chan_bar_memory + i * chsize, chsize,
                     PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
@@ -472,6 +478,25 @@ static int pscnv_save_live_setup(QEMUFile *f, void *opaque) {
     // TODO: this can be optimized?
     memcpy(d->chan_bar_memory, channel_content, d->chan_bar_size);
     munmap(channel_content, d->chan_bar_size);
+
+    /**
+     * Add migration log entries for all existing objects so that these are
+     * copied in pscnv_save_live_iterate.
+     */
+    for (i = 0; i < d->alloc_count; i++) {
+        struct pscnv_memory_allocation *obj = &d->alloc_data[i];
+        if (obj->size != (uint64_t)-1) {
+            pscnv_add_migration_log_entry(d, i, PSCNV_MIGRATION_LOG_ALLOC);
+        }
+    }
+
+    fprintf(stderr, "unfreeze.\n");
+    if (saved_vm_running) {
+        vm_start();
+    }
+
+    d->halted = 0;
+    d->start_time = time(NULL);
 
     /**
      * Map GPU memory contents.
@@ -528,30 +553,42 @@ static int pscnv_save_live_setup(QEMUFile *f, void *opaque) {
     memory_region_set_dirty(&d->vram_bar, 0, PSCNV_VIRT_VRAM_SIZE);
     memory_region_sync_dirty_bitmap(&d->vram_bar);*/
 
-    /**
-     * Add migration log entries for all existing objects so that these are
-     * copied in pscnv_save_live_iterate.
-     */
-    for (i = 0; i < d->alloc_count; i++) {
-        struct pscnv_memory_allocation *obj = &d->alloc_data[i];
-        if (obj->size != (uint64_t)-1) {
-            pscnv_add_migration_log_entry(d, i, PSCNV_MIGRATION_LOG_ALLOC);
-        }
-    }
-
     qemu_put_byte(f, PSCNV_SAVE_EOS);
 
-    if (saved_vm_running) {
-        vm_start();
-    }
+    fprintf(stderr, "pscnv_save_live_setup done: %lfms\n",
+            (double)(get_time() - start) / 1000);
     return 0;
 }
 
 static int pscnv_save_live_iterate(QEMUFile *f, void *opaque) {
     int ret;
+    int i;
     PscnvState *d = opaque;
+    uint64_t start = get_time();
 
     fprintf(stderr, "pscnv_save_live_iterate\n");
+
+    if (!d->halted) {
+        /**
+         * Delete the channels now that the GPU has been halted.
+         */
+        // HACK!
+        if (time(NULL) - d->start_time < 4) {
+            return 0;
+        }
+
+        for (i = 0; i < PSCNV_VIRT_CHAN_COUNT; i++) {
+            if (d->chan_handle_tmp[i] != (uint32_t)-1) {
+                fprintf(stderr, "pscnv_save_live_setup: Deleting channel %d.\n", i);
+                /* delete the channel */
+                ret = pscnv_chan_free(d->drm_fd, d->chan_handle_tmp[i]);
+                if (ret) {
+                    fprintf(stderr, "pscnv_virt: could not free channel (%d)\n", ret);
+                }
+            }
+        }
+        d->halted = 1;
+    }
 
     /* transmit all memory buffers */
     while ((ret = qemu_file_rate_limit(f)) == 0) {
@@ -566,6 +603,8 @@ static int pscnv_save_live_iterate(QEMUFile *f, void *opaque) {
 
     qemu_put_byte(f, PSCNV_SAVE_EOS);
 
+    fprintf(stderr, "pscnv_save_live_iterate done: %lfms\n",
+            (double)(get_time() - start) / 1000);
     return 0;
 }
 static int pscnv_save_live_complete(QEMUFile *f, void *opaque) {

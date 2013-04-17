@@ -55,9 +55,10 @@
 #define PSCNV_RESULT_UNKNOWN_CMD 0x80000001
 #define PSCNV_RESULT_ERROR 0x80000002
 
-#define DUMP_HYPERCALLS
-/*#define PSCNV_DEBUG_CHAN_ACCESS
-#define PSCNV_DEBUG_VRAM_ACCESS*/
+/*#define DUMP_MMIO_ACCESS */
+/*#define DUMP_HYPERCALLS*/
+/*define PSCNV_DEBUG_CHAN_ACCESS*/
+/*#define PSCNV_DEBUG_VRAM_ACCESS*/
 
 struct pscnv_vspace_mapping {
     uint32_t obj;
@@ -233,6 +234,9 @@ typedef struct {
     QemuMutex migration_log_lock;
     struct pscnv_migration_log_entry *migration_log_start;
     struct pscnv_migration_log_entry *migration_log_end;
+    int halted;
+    int start_time;
+    uint32_t chan_handle_tmp[PSCNV_VIRT_CHAN_COUNT];
 } PscnvState;
 
 extern SaveVMHandlers pscnv_save_handlers;
