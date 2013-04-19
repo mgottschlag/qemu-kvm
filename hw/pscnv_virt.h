@@ -237,6 +237,12 @@ typedef struct {
     int halted;
     int start_time;
     uint32_t chan_handle_tmp[PSCNV_VIRT_CHAN_COUNT];
+
+    uint32_t current_obj;
+    void *current_obj_data;
+    uint32_t current_obj_pos;
+    uint32_t current_obj_size;
+    struct pscnv_dma *dma;
 } PscnvState;
 
 extern SaveVMHandlers pscnv_save_handlers;
@@ -253,6 +259,14 @@ void pscnv_add_vspace_mapping(PscnvState *d, uint32_t vspace,
                               uint32_t flags);
 void pscnv_remove_vspace_mapping(PscnvState *d,
                                  struct pscnv_vspace_mapping *mapping);
+
+struct pscnv_dma;
+int pscnv_dma_init(struct pscnv_dma **dma, int drm_fd);
+int pscnv_dma_uninit(struct pscnv_dma *dma);
+void *pscnv_dma_to_sysram(struct pscnv_dma *dma, uint32_t handle,
+                          uint64_t size);
+
+int pscnv_dma_test(struct pscnv_dma *dma);
 
 #endif
 

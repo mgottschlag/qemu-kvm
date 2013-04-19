@@ -15,6 +15,7 @@
 #define PSCNV_SAVE_VSPACE_MAP 0x7
 #define PSCNV_SAVE_CHAN 0x8
 #define PSCNV_SAVE_FINISH 0x9
+#define PSCNV_SAVE_DATA 0xa
 
 static uint64_t get_time(void) {
     uint64_t usecs;
@@ -331,6 +332,22 @@ static int pscnv_save_log_entry(PscnvState *d, QEMUFile *f) {
     struct pscnv_memory_area mapping;
     void *buffer_data = NULL;
 
+    /* transmit object content after LOG_ALLOC */
+    if (d->current_obj != (uint32_t)-1) {
+        qemu_put_byte(f, PSCNV_SAVE_DATA);
+        qemu_put_be32(f, d->current_obj);
+        qemu_put_be32(f, d->current_obj_pos);
+        qemu_put_be32(f, 0x1000);
+        qemu_put_buffer(f, (unsigned char*)d->current_obj_data + d->current_obj_pos,
+                        0x1000);
+        d->current_obj_pos += 0x1000;
+        if (d->current_obj_pos >= d->current_obj_size) {
+            d->current_obj = -1;
+            munmap(d->current_obj_data, d->current_obj_size);
+        }
+        return 1;
+    }
+
     qemu_mutex_lock(&d->migration_log_lock);
     /* check whether the log is empty */
     if (d->migration_log_start == NULL) {
@@ -353,10 +370,15 @@ static int pscnv_save_log_entry(PscnvState *d, QEMUFile *f) {
     }
     /* for allocation entries we also need to map the buffer in case it is
      * deleted later */
-    if (entry.type == PSCNV_MIGRATION_LOG_ALLOC) {
-        buffer_data = mmap(NULL, obj.size, PROT_READ | PROT_WRITE,
-                           MAP_SHARED, d->drm_fd, obj.map_handle);
-        assert(buffer_data != MAP_FAILED);
+    if (entry.type == PSCNV_MIGRATION_LOG_ALLOC && obj.mapping == NULL) {
+        if (obj.flags & PSCNV_GEM_SYSRAM_SNOOP) {
+            buffer_data = mmap(NULL, obj.size, PROT_READ | PROT_WRITE,
+                               MAP_SHARED, d->drm_fd, obj.map_handle);
+            assert(buffer_data != MAP_FAILED);
+        } else {
+            buffer_data = pscnv_dma_to_sysram(d->dma, obj.handle, obj.size);
+            assert(buffer_data != NULL);
+        }
     }
     qemu_mutex_unlock(&d->migration_log_lock);
 
@@ -371,14 +393,17 @@ static int pscnv_save_log_entry(PscnvState *d, QEMUFile *f) {
         fprintf(stderr, "ALLOC %x %x %x %x %"PRIx64"\n", entry.handle,
                 obj.cookie, obj.flags, obj.tile_flags, obj.size);
         if (obj.mapping == NULL) {
-            uint64_t start = get_time();
+            /*uint64_t start = get_time();
             qemu_put_buffer(f, buffer_data, obj.size);
-            fprintf(stderr, "transfer: %lfms\n", (double)(get_time() - start) / 1000);
+            fprintf(stderr, "transfer: %lfms\n", (double)(get_time() - start) / 1000);*/
+            d->current_obj = entry.handle;
+            d->current_obj_pos = 0;
+            d->current_obj_size = obj.size;
+            d->current_obj_data = buffer_data;
         } else {
             qemu_put_be32(f, mapping.start);
             qemu_put_be32(f, mapping.size);
         }
-        munmap(buffer_data, obj.size);
     } else if (entry.type == PSCNV_MIGRATION_LOG_FREE) {
         qemu_put_byte(f, PSCNV_SAVE_FREE);
         qemu_put_be32(f, entry.handle);
@@ -418,6 +443,7 @@ static int pscnv_save_live_setup(QEMUFile *f, void *opaque) {
     fprintf(stderr, "pscnv_save_live_setup\n");
 
     d->migration_active = 1;
+    d->current_obj = -1;
 
     memcpy(d->chan_handle_tmp, d->chan_handle, sizeof(d->chan_handle));
 
@@ -565,6 +591,7 @@ static int pscnv_save_live_iterate(QEMUFile *f, void *opaque) {
     int i;
     PscnvState *d = opaque;
     uint64_t start = get_time();
+    /*uint64_t transmit_start;*/
 
     fprintf(stderr, "pscnv_save_live_iterate\n");
 
@@ -574,6 +601,7 @@ static int pscnv_save_live_iterate(QEMUFile *f, void *opaque) {
          */
         // HACK!
         if (time(NULL) - d->start_time < 4) {
+            qemu_put_byte(f, PSCNV_SAVE_EOS);
             return 0;
         }
 
@@ -591,7 +619,8 @@ static int pscnv_save_live_iterate(QEMUFile *f, void *opaque) {
     }
 
     /* transmit all memory buffers */
-    while ((ret = qemu_file_rate_limit(f)) == 0) {
+    /*transmit_start = get_time();*/
+    while ((ret = qemu_file_rate_limit(f)) == 0/* && get_time() - transmit_start < 100000*/) {
         if (pscnv_save_log_entry(d, f) == 0) {
             qemu_put_byte(f, PSCNV_SAVE_EOS);
             return 1;
@@ -702,7 +731,6 @@ static int pscnv_load_state(QEMUFile *f, void *opaque, int version_id) {
             uint32_t flags = qemu_get_be32(f);
             uint32_t tile_flags = qemu_get_be32(f);
             int mapped = qemu_get_byte(f);
-            void *buffer_data;
             /* allocate a gem object */
             fprintf(stderr, "pscnv_gem_new: %x %x %x %x %"PRIx64"\n", handle, cookie,
                     flags, tile_flags, size);
@@ -734,22 +762,42 @@ static int pscnv_load_state(QEMUFile *f, void *opaque, int version_id) {
                 }
                 d->alloc_data[handle].mapping->handle = handle;
             } else {
-                buffer_data = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                /*buffer_data = mmap(NULL, size, PROT_READ | PROT_WRITE,
                                    MAP_SHARED, d->drm_fd, result.map_handle);
                 assert(buffer_data != MAP_FAILED);
                 qemu_get_buffer(f, buffer_data, size);
-                munmap(buffer_data, size);
+                munmap(buffer_data, size);*/
             }
-            // TODO: initially the whole pci memory space must be mapped!
+        } else if (type == PSCNV_SAVE_DATA) {
+            uint32_t handle = qemu_get_be32(f);
+            // TODO: this should be 64 bit
+            uint32_t offset = qemu_get_be32(f);
+            uint32_t size = qemu_get_be32(f);
+            struct pscnv_memory_allocation *obj = &d->alloc_data[handle];
+            if (handle != d->current_obj) {
+                if (d->current_obj != (uint32_t)-1) {
+                    munmap(d->current_obj_data, d->current_obj_size);
+                }
+                d->current_obj = handle;
+                d->current_obj_data = mmap(NULL, obj->size, PROT_READ | PROT_WRITE,
+                                           MAP_SHARED, d->drm_fd, obj->map_handle);
+                d->current_obj_size = obj->size;
+            }
+            qemu_get_buffer(f, (unsigned char*)d->current_obj_data + offset, size);
         } else if (type == PSCNV_SAVE_FREE) {
             uint32_t handle = qemu_get_be32(f);
             struct pscnv_memory_allocation *obj = &d->alloc_data[handle];
-            /* free the underlying gpu buffer */
-            pscnv_gem_close(d->drm_fd, obj->handle);
             /* clear the mapping */
             if (obj->mapping != NULL) {
                 pscnv_free_memory(d, obj->mapping);
             }
+            /* invalidate the migration mapping as well */
+            if (d->current_obj == handle) {
+                munmap(d->current_obj_data, d->current_obj_size);
+                d->current_obj = -1;
+            }
+            /* free the underlying gpu buffer */
+            pscnv_gem_close(d->drm_fd, obj->handle);
             /* free the allocation list entry */
             obj->next = d->alloc_freelist;
             d->alloc_freelist = handle;
@@ -818,6 +866,10 @@ static int pscnv_load_state(QEMUFile *f, void *opaque, int version_id) {
             }
             /*qemu_get_buffer(f, (void*)d->chan_bar_memory + handle * chsize, chsize);*/
         } else if (type == PSCNV_SAVE_FINISH) {
+            if (d->current_obj != (uint32_t)-1) {
+                munmap(d->current_obj_data, d->current_obj_size);
+                d->current_obj = -1;
+            }
             fprintf(stderr, "pscnv_virt: Done!\n");
             pscnv_revert_migration_mappings(d);
             pscnv_resume_channels(d);

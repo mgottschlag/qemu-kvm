@@ -287,6 +287,11 @@ static void pscnv_execute_mem_free(PscnvState *d,
                                           PSCNV_MIGRATION_LOG_FREE);
         }
         qemu_mutex_unlock(&d->migration_log_lock);
+        /* also stop transmitting this object */
+        if (d->current_obj == cmd->handle) {
+            munmap(d->current_obj_data, d->current_obj_size);
+            d->current_obj = -1;
+        }
     }
 }
 static void pscnv_execute_vspace_alloc(PscnvState *d,
@@ -1103,6 +1108,14 @@ static int pci_pscnv_init(PCIDevice *pci_dev)
     d->migration_log_start = NULL;
     d->migration_log_end = NULL;
     d->migration_active = 0;
+    d->current_obj = -1;
+
+    if (pscnv_dma_init(&d->dma, d->drm_fd)) {
+        return -1;
+    }
+    /*if (pscnv_dma_test(d->dma)) {
+        return -1;
+    }*/
 
     return 0;
 }

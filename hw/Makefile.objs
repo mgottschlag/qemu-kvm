@@ -36,10 +36,12 @@ hw-obj-$(CONFIG_APPLESMC) += applesmc.o
 hw-obj-$(CONFIG_SMARTCARD) += ccid-card-passthru.o
 hw-obj-$(CONFIG_SMARTCARD_NSS) += ccid-card-emulated.o
 hw-obj-$(CONFIG_I8259) += i8259_common.o i8259.o
-hw-obj-$(CONFIG_PSCNV) += pscnv_virt.o pscnv_virt_migration.o
+hw-obj-$(CONFIG_PSCNV) += pscnv_virt.o pscnv_virt_migration.o pscnv_virt_dma.o pscnv/libpscnv_ib.o
 
 $(obj)/pscnv_virt.o: QEMU_CFLAGS += -I/usr/include/libdrm -I/usr/local/include/pscnv
 $(obj)/pscnv_virt_migration.o: QEMU_CFLAGS += -I/usr/include/libdrm -I/usr/local/include/pscnv
+$(obj)/pscnv_virt_dma.o: QEMU_CFLAGS += -I/usr/include/libdrm -I/usr/local/include/pscnv
+$(obj)/pscnv/libpscnv_ib.o: QEMU_CFLAGS += -I/usr/include/libdrm -I/usr/local/include/pscnv
 
 # PPC devices
 hw-obj-$(CONFIG_PREP_PCI) += prep_pci.o
